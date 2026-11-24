@@ -257,6 +257,153 @@ class AgyPercentOverflowTest(unittest.TestCase):
         )
 
 
+class ProviderIntegerStorageLimitTest(unittest.TestCase):
+    SQLITE_MAX = 2**63 - 1
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "quota.sqlite3"
+
+    @staticmethod
+    def agy_payload(window):
+        return {
+            "status": "success",
+            "command": {
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini",
+                            "buckets": [
+                                {
+                                    "id": "weekly",
+                                    "window": window,
+                                    "remaining_fraction": 0.5,
+                                    "reset_time": "2026-01-08T00:00:00Z",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        }
+
+    @staticmethod
+    def codex_result(duration):
+        return {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "usedPercent": 10,
+                        "windowDurationMins": duration,
+                        "resetsAt": 1767225600,
+                    }
+                }
+            }
+        }
+
+    def report_at(self, config, when):
+        return json_output(
+            run_cli(
+                "report", "--config", config, "--now", when, "--json"
+            )
+        )
+
+    def test_codex_duration_storage_max_is_accepted_and_overflow_is_a_source_failure(self):
+        agy = write_fake_agy(self.tmp, payload=self.agy_payload("5h"))
+        codex = write_fake_codex(
+            self.tmp, result=self.codex_result(self.SQLITE_MAX)
+        )
+        config = write_config(
+            self.tmp,
+            [source("codex", "work", codex), source("agy", "personal", agy)],
+            database=self.db,
+        )
+        first = run_cli(
+            "sample", "--config", config, "--now", "2026-01-01T00:00:00Z", "--json"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        initial = self.report_at(config, "2026-01-01T00:01:00Z")
+        codex_account = next(item for item in initial["accounts"] if item["provider"] == "codex")
+        self.assertEqual(codex_account["windows"][0]["window_minutes"], self.SQLITE_MAX)
+
+        for index, duration in enumerate((1e308, self.SQLITE_MAX + 1), start=1):
+            write_fake_codex(self.tmp, result=self.codex_result(duration))
+            when = f"2026-01-01T00:{15 * index:02d}:00Z"
+            sample = run_cli(
+                "sample", "--config", config, "--now", when, "--json"
+            )
+            self.assertEqual(sample.returncode, 1, sample.stderr)
+            outcomes = {
+                item["provider"]: item for item in json_output(sample)["sampled"]
+            }
+            self.assertEqual(outcomes["codex"]["status"], "failure")
+            self.assertEqual(outcomes["agy"]["status"], "success")
+
+        final = self.report_at(config, "2026-01-01T00:31:00Z")
+        accounts = {item["provider"]: item for item in final["accounts"]}
+        self.assertEqual(accounts["codex"]["last_attempt"]["status"], "failure")
+        self.assertEqual(
+            accounts["codex"]["last_success"]["sampled_at"],
+            "2026-01-01T00:00:00Z",
+        )
+        self.assertEqual(
+            accounts["codex"]["windows"][0]["window_minutes"], self.SQLITE_MAX
+        )
+        self.assertEqual(
+            accounts["agy"]["last_attempt"]["sampled_at"],
+            "2026-01-01T00:30:00Z",
+        )
+
+    def test_agy_integer_window_storage_max_is_accepted_and_overflow_is_a_source_failure(self):
+        agy = write_fake_agy(
+            self.tmp, payload=self.agy_payload(self.SQLITE_MAX)
+        )
+        codex = write_fake_codex(
+            self.tmp, result=self.codex_result(10080)
+        )
+        config = write_config(
+            self.tmp,
+            [source("agy", "personal", agy), source("codex", "work", codex)],
+            database=self.db,
+        )
+        first = run_cli(
+            "sample", "--config", config, "--now", "2026-01-01T00:00:00Z", "--json"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        initial = self.report_at(config, "2026-01-01T00:01:00Z")
+        agy_account = next(item for item in initial["accounts"] if item["provider"] == "agy")
+        self.assertEqual(agy_account["windows"][0]["window_minutes"], self.SQLITE_MAX)
+
+        for index, window in enumerate((10**30, self.SQLITE_MAX + 1), start=1):
+            write_fake_agy(self.tmp, payload=self.agy_payload(window))
+            when = f"2026-01-01T00:{15 * index:02d}:00Z"
+            sample = run_cli(
+                "sample", "--config", config, "--now", when, "--json"
+            )
+            self.assertEqual(sample.returncode, 1, sample.stderr)
+            outcomes = {
+                item["provider"]: item for item in json_output(sample)["sampled"]
+            }
+            self.assertEqual(outcomes["agy"]["status"], "failure")
+            self.assertEqual(outcomes["codex"]["status"], "success")
+
+        final = self.report_at(config, "2026-01-01T00:31:00Z")
+        accounts = {item["provider"]: item for item in final["accounts"]}
+        self.assertEqual(accounts["agy"]["last_attempt"]["status"], "failure")
+        self.assertEqual(
+            accounts["agy"]["last_success"]["sampled_at"], "2026-01-01T00:00:00Z"
+        )
+        self.assertEqual(
+            accounts["agy"]["windows"][0]["window_minutes"], self.SQLITE_MAX
+        )
+        self.assertEqual(
+            accounts["codex"]["last_attempt"]["sampled_at"],
+            "2026-01-01T00:30:00Z",
+        )
+
+
 class CodexInvalidDurationTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

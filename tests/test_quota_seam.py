@@ -123,6 +123,75 @@ class ObservationSeamTest(unittest.TestCase):
             ingest_observation(self.tmp / "center.sqlite3", observation)
 
 
+    def test_integer_and_numeric_persistence_limits_on_ingest_and_replay(self):
+        self.sample("2026-01-01T00:00:00Z", 0.5)
+        valid = list(iter_observations(self.db))[0].to_dict()
+        maximum = 2**63 - 1
+
+        accepted = copy.deepcopy(valid)
+        accepted["interval_seconds"] = maximum
+        accepted["windows"][0]["window_minutes"] = maximum
+        observation = Observation.from_dict(accepted)
+        self.assertEqual(observation.interval_seconds, maximum)
+        self.assertEqual(observation.windows[0].window_minutes, maximum)
+
+        center = self.tmp / "limits.sqlite3"
+        self.assertTrue(ingest_observation(center, observation))
+        replayed = read_observation(center, observation.sample_id)
+        self.assertIsNotNone(replayed)
+        self.assertEqual(replayed.interval_seconds, maximum)
+        self.assertEqual(replayed.windows[0].window_minutes, maximum)
+        self.assertFalse(ingest_observation(center, accepted))
+
+        dated = run_cli(
+            "report",
+            "--db",
+            center,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-01T00:01:00Z",
+            "--json",
+        )
+        self.assertEqual(dated.returncode, 0, dated.stderr)
+        dated_account = json_output(dated)["accounts"][0]
+        self.assertEqual(dated_account["interval_seconds"], maximum)
+        self.assertFalse(dated_account["stale"])
+        checked = run_cli(
+            "report",
+            "--db",
+            center,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-01T00:01:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        rejected = [
+            ("window_minutes", maximum + 1),
+            ("window_minutes", 10**400),
+            ("interval_seconds", maximum + 1),
+            ("interval_seconds", 10**400),
+            ("interval_seconds", 1e308),
+            ("source_value", 10**400),
+            ("display_percent", 10**400),
+        ]
+        for field, value in rejected:
+            payload = copy.deepcopy(valid)
+            if field == "window_minutes":
+                payload["windows"][0][field] = value
+            elif field in ("source_value", "display_percent"):
+                payload["windows"][0]["remaining"][field] = value
+            else:
+                payload[field] = value
+            with self.assertRaises(ValueError, msg=f"{field}={value!r}"):
+                Observation.from_dict(payload)
+            with self.assertRaises(ValueError, msg=f"ingest {field}={value!r}"):
+                ingest_observation(center, payload)
+
+
     def test_rejects_non_list_window_shapes_as_value_errors(self):
         self.sample("2026-01-01T00:00:00Z", 0.5)
         valid = list(iter_observations(self.db))[0].to_dict()

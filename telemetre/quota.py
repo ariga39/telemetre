@@ -46,6 +46,7 @@ DEFAULT_INTERVAL_SECONDS = 15 * 60
 DEFAULT_TIMEOUT_SECONDS = 60.0
 STALE_INTERVALS = 2
 CLOCK_SKEW_TOLERANCE_SECONDS = 5 * 60
+SQLITE_INTEGER_MAX = 2**63 - 1
 
 PROVIDER_AGY = "agy"
 PROVIDER_CODEX = "codex"
@@ -141,6 +142,54 @@ def _json_loads_strict(text: str):
     )
 
 
+def _coerce_persisted_int(
+    value: Any,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int = SQLITE_INTEGER_MAX,
+    allow_string: bool = False,
+) -> int:
+    """Return an integer that can be bound to a SQLite INTEGER safely."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be a finite integer")
+        parsed = int(value)
+    elif allow_string and isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{name} must be an integer") from None
+    else:
+        raise ValueError(f"{name} must be an integer")
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
+def _coerce_finite_float(value: Any, *, name: str) -> float | None:
+    """Return a finite float, turning Python integer overflow into ValueError."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} is too large to store") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
+
+
 def _json_load(text: str | None, default=None):
     if text is None:
         return default
@@ -216,16 +265,25 @@ class WindowObservation:
             reset = {}
         elif not isinstance(reset, Mapping):
             raise ValueError("window reset must be an object")
+        window_minutes = data.get("window_minutes")
+        if window_minutes is not None:
+            window_minutes = _coerce_persisted_int(
+                window_minutes, name="window_minutes", minimum=0
+            )
         return cls(
             group=str(data.get("group") or ""),
             bucket_id=str(data.get("bucket_id") or ""),
             limit_id=data.get("limit_id"),
             slot=data.get("slot"),
             window=data.get("window"),
-            window_minutes=data.get("window_minutes"),
-            remaining_value=remaining.get("source_value"),
+            window_minutes=window_minutes,
+            remaining_value=_coerce_finite_float(
+                remaining.get("source_value"), name="remaining.source_value"
+            ),
             remaining_unit=remaining.get("source_unit"),
-            remaining_display=remaining.get("display_percent"),
+            remaining_display=_coerce_finite_float(
+                remaining.get("display_percent"), name="remaining.display_percent"
+            ),
             reset_raw=reset.get("raw"),
             reset_at=reset.get("at"),
             anomalies=tuple(data.get("anomalies") or ()),
@@ -289,13 +347,11 @@ class Observation:
             raise ValueError("observation windows must be a list")
         windows = tuple(WindowObservation.from_dict(item) for item in raw_windows)
         error = data.get("error") or {}
-        interval = data.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
-        try:
-            interval = int(interval)
-        except (TypeError, ValueError):
-            raise ValueError("interval_seconds must be an integer") from None
-        if interval <= 0:
-            raise ValueError("interval_seconds must be positive")
+        interval = _coerce_persisted_int(
+            data.get("interval_seconds", DEFAULT_INTERVAL_SECONDS),
+            name="interval_seconds",
+            minimum=1,
+        )
         observation = cls(
             provider=provider,
             account=account,
@@ -362,11 +418,14 @@ def load_config(path: str | os.PathLike | None) -> Config:
         if not account:
             raise QuotaError("provider account must not be empty")
         try:
-            interval = int(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS))
-        except (TypeError, ValueError):
-            raise QuotaError("interval_seconds must be an integer") from None
-        if interval <= 0:
-            raise QuotaError("interval_seconds must be positive")
+            interval = _coerce_persisted_int(
+                raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS),
+                name="interval_seconds",
+                minimum=1,
+                allow_string=True,
+            )
+        except ValueError as exc:
+            raise QuotaError(str(exc)) from None
         try:
             timeout = float(raw.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
         except (TypeError, ValueError):
@@ -556,11 +615,14 @@ def _collect_agy(source: SourceConfig) -> tuple[tuple[WindowObservation, ...], b
             elif isinstance(amount, bool) or not isinstance(amount, (int, float)):
                 raise CollectionError("unrecognized_structure", "remaining_fraction is not numeric")
             else:
-                numeric_amount = float(amount)
-                if not math.isfinite(numeric_amount):
+                try:
+                    numeric_amount = _coerce_finite_float(
+                        amount, name="remaining_fraction"
+                    )
+                except ValueError:
                     raise CollectionError(
                         "unrecognized_structure", "remaining_fraction is not finite"
-                    )
+                    ) from None
                 unit = "fraction"
                 display = max(0.0, numeric_amount * 100.0)
                 if not 0.0 <= numeric_amount <= 1.0:
@@ -599,9 +661,21 @@ def _window_minutes(raw: Any) -> int | None:
     if isinstance(raw, bool):
         return None
     if isinstance(raw, int):
-        return raw if raw >= 0 else None
+        if raw < 0:
+            return None
+        try:
+            return _coerce_persisted_int(raw, name="window", minimum=0)
+        except ValueError:
+            raise CollectionError(
+                "invalid_window", "window is outside the supported range"
+            ) from None
     if isinstance(raw, float) and raw.is_integer() and raw >= 0:
-        return int(raw)
+        try:
+            return _coerce_persisted_int(raw, name="window", minimum=0)
+        except ValueError:
+            raise CollectionError(
+                "invalid_window", "window is outside the supported range"
+            ) from None
     if isinstance(raw, str):
         match = re.fullmatch(r"\s*(\d+)\s*(m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)\s*", raw, re.I)
         if not match:
@@ -609,10 +683,15 @@ def _window_minutes(raw: Any) -> int | None:
         value = int(match.group(1))
         unit = match.group(2).lower()
         if unit.startswith("d"):
-            return value * 1440
-        if unit.startswith("h"):
-            return value * 60
-        return value
+            value *= 1440
+        elif unit.startswith("h"):
+            value *= 60
+        try:
+            return _coerce_persisted_int(value, name="window", minimum=0)
+        except ValueError:
+            raise CollectionError(
+                "invalid_window", "window is outside the supported range"
+            ) from None
     return None
 
 
@@ -781,11 +860,12 @@ def _window_from_codex_slot(
     elif isinstance(used, bool) or not isinstance(used, (int, float)):
         raise CollectionError("unrecognized_structure", "usedPercent is not numeric")
     else:
-        numeric_used = float(used)
-        if not math.isfinite(numeric_used):
+        try:
+            numeric_used = _coerce_finite_float(used, name="usedPercent")
+        except ValueError:
             raise CollectionError(
                 "unrecognized_structure", "usedPercent is not finite"
-            )
+            ) from None
         unit = "percent_used"
         display = max(0.0, 100.0 - numeric_used)
         if not 0.0 <= numeric_used <= 100.0:
@@ -795,13 +875,15 @@ def _window_from_codex_slot(
     if duration is not None:
         if isinstance(duration, bool) or not isinstance(duration, (int, float)):
             raise CollectionError("unrecognized_structure", "windowDurationMins is not numeric")
-        if not math.isfinite(float(duration)):
-            raise CollectionError(
-                "unrecognized_structure", "windowDurationMins is not finite"
+        try:
+            minutes = _coerce_persisted_int(
+                duration, name="windowDurationMins", minimum=0
             )
-        minutes = int(duration)
-        if minutes < 0:
-            raise CollectionError("invalid_window", "windowDurationMins is negative")
+        except ValueError:
+            raise CollectionError(
+                "invalid_window",
+                "windowDurationMins is outside the supported range",
+            ) from None
     resets_raw = raw_slot.get("resetsAt")
     reset_at = None
     if resets_raw is None or resets_raw == 0 or resets_raw == "0":
@@ -995,29 +1077,19 @@ def _validate_observation(observation: Observation) -> None:
         raise ValueError("failure observations must not carry windows")
     if not observation.sample_id:
         raise ValueError("sample_id must not be empty")
-    if observation.interval_seconds <= 0:
-        raise ValueError("interval_seconds must be positive")
+    _coerce_persisted_int(
+        observation.interval_seconds, name="interval_seconds", minimum=1
+    )
     _timestamp_from_any(observation.sampled_at)
     for window in observation.windows:
         if not window.group or not window.bucket_id:
             raise ValueError("quota window has an empty group or bucket id")
-        for name, value in (
-            ("remaining_value", window.remaining_value),
-            ("remaining_display", window.remaining_display),
-        ):
-            if value is None:
-                continue
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be numeric")
-            if not math.isfinite(float(value)):
-                raise ValueError(f"{name} must be finite")
+        _coerce_finite_float(window.remaining_value, name="remaining_value")
+        _coerce_finite_float(window.remaining_display, name="remaining_display")
         if window.window_minutes is not None:
-            if isinstance(window.window_minutes, bool) or not isinstance(
-                window.window_minutes, int
-            ):
-                raise ValueError("window_minutes must be an integer")
-            if window.window_minutes < 0:
-                raise ValueError("window_minutes must not be negative")
+            _coerce_persisted_int(
+                window.window_minutes, name="window_minutes", minimum=0
+            )
         if window.reset_at is not None:
             _timestamp_from_any(window.reset_at)
 
@@ -1142,6 +1214,9 @@ def ingest_observation(
     if not isinstance(observation, Observation):
         observation = Observation.from_dict(observation)
     _validate_observation(observation)
+    interval_seconds = _coerce_persisted_int(
+        observation.interval_seconds, name="interval_seconds", minimum=1
+    )
     received = _now(received_at)
     sampled = _timestamp_from_any(observation.sampled_at)
     time_anomaly = sampled > received + timedelta(seconds=CLOCK_SKEW_TOLERANCE_SECONDS)
@@ -1173,7 +1248,7 @@ def ingest_observation(
                     observation.error_detail,
                     int(observation.empty_windows),
                     int(time_anomaly),
-                    observation.interval_seconds,
+                    interval_seconds,
                     observation.collector_version,
                     digest,
                 ),
@@ -1191,6 +1266,19 @@ def ingest_observation(
                     )
                 return False
             for ordinal, window in enumerate(observation.windows):
+                window_minutes = (
+                    None
+                    if window.window_minutes is None
+                    else _coerce_persisted_int(
+                        window.window_minutes, name="window_minutes", minimum=0
+                    )
+                )
+                remaining_value = _coerce_finite_float(
+                    window.remaining_value, name="remaining_value"
+                )
+                remaining_display = _coerce_finite_float(
+                    window.remaining_display, name="remaining_display"
+                )
                 connection.execute(
                     """
                     INSERT INTO quota_windows (
@@ -1207,10 +1295,10 @@ def ingest_observation(
                         window.limit_id,
                         window.slot,
                         _json_dump(window.window),
-                        window.window_minutes,
-                        window.remaining_value,
+                        window_minutes,
+                        remaining_value,
                         window.remaining_unit,
-                        window.remaining_display,
+                        remaining_display,
                         _json_dump(window.reset_raw),
                         window.reset_at,
                         _json_dump(list(window.anomalies)),

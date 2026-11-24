@@ -183,6 +183,12 @@ non-JSON output, unrecognized envelope, malformed bucket/slot, non-finite
 number, or a finite source number whose derived display overflows (for example
 `remaining_fraction: 1e308`) is a **failure observation**:
 
+Normalized integers that are persisted must fit SQLite's signed 64-bit range
+(`0..2**63-1`, with sampling intervals starting at `1`). Raw provider window
+labels stay JSON text, but a normalized window duration or interval outside that
+range is a malformed source response, not a storage crash. Finite numeric source
+values that cannot be converted safely are also rejected before binding.
+
 - it is stored with a stable sample id and a short generic error kind/detail;
 - it carries no partial buckets;
 - it does not replace the latest successful snapshot;
@@ -274,7 +280,8 @@ for observation in iter_observations(
     # send payload over the authenticated delivery channel
 
 # Observation.from_dict(payload) validates the shape and raises ValueError for
-# non-list windows or invalid window rows, rather than leaking AttributeError.
+# non-list windows, invalid rows, out-of-range persisted integers, and
+# non-finite or overflowing numeric values.
 
 is_new = ingest_observation(center_db, payload, received_at=None)
 # False means an idempotent replay. Raises ObservationConflict if the same
