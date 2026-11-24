@@ -126,6 +126,22 @@ class CurrentReportSemanticsTest(unittest.TestCase):
         self.assertTrue(window["freshness"]["pending_refresh"])
         self.assertEqual(window["remaining"]["display_percent"], 50.0)
 
+    def test_net_change_uses_the_preceding_sample_cadence_not_current_config(self):
+        self.sample_at("2026-01-01T00:00:00Z", agy_payload(0.6))
+        self.sample_at("2026-01-01T00:15:00Z", agy_payload(0.5))
+        write_config(
+            self.tmp,
+            [source("agy", "personal", self.agy, interval_seconds=60)],
+            database=self.db,
+        )
+        report = self.report_at("2026-01-01T00:16:00Z")
+        window = report["accounts"][0]["windows"][0]
+        self.assertTrue(window["change"]["comparable"])
+        self.assertAlmostEqual(window["change"]["delta_percent"], -10.0)
+        self.assertEqual(
+            window["change"]["previous_sampled_at"], "2026-01-01T00:00:00Z"
+        )
+
     def test_breaks_net_change_comparison_across_a_sampling_gap(self):
         self.sample_at("2026-01-01T00:00:00Z", agy_payload(0.6))
         self.sample_at("2026-01-01T00:15:00Z", agy_payload(0.5))

@@ -239,14 +239,19 @@ Dated report:
   (`Asia/Shanghai` on 2026-01-01 is `2025-12-31T16:00Z` through
   `2026-01-01T16:00Z`);
 - only stored snapshots in the range are replayed; nothing is fetched from a
-  provider, and gap/staleness checks use the interval recorded with those
-  samples rather than a later config change;
+  provider. Each elapsed segment uses the preceding observation's recorded
+  interval, the starting segment uses the last sample before the day (or the
+  first sample in it), and the trailing boundary, staleness, and displayed
+  `interval_seconds` use the most recent recorded interval. A later config
+  change therefore does not rewrite history;
 - each window reports the minimum observed remaining percentage and its
   observation time, the latest value/time, observation count, and whether the
   range contains a sampling gap;
 - consecutive zero observations in the same window count as one observed
-  bottom segment. A gap does not create an inferred extra bottom, and no
-  balance or bottom count is invented across a gap;
+  bottom segment. Gaps and net-change breaks use the same per-segment recorded
+  cadence, so a cadence change by itself does not create a gap; a missed segment
+  at the actual fast cadence remains visible. A gap does not create an inferred
+  extra bottom, and no balance or bottom count is invented across a gap;
 - reset changes create separate window histories;
 - missing intervals are reported explicitly, including a partial current day
   ending at report time;
