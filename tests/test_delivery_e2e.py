@@ -179,6 +179,61 @@ class DeliveryEndToEndTest(unittest.TestCase):
         self.assertEqual([row["machine"] for row in account["machines"]], ["alpha", "beta"])
         self.assertNotIn(SECRET.encode(), self.center.read_bytes())
 
+    def test_send_refuses_a_spool_that_does_not_match_the_selected_binding(self) -> None:
+        client = _collect(
+            self.tmp,
+            "alpha",
+            "conv-identity",
+            [
+                model_step(
+                    0,
+                    "2026-11-02T00:00:00Z",
+                    input_tokens=10,
+                    cache_read_tokens=1,
+                    output_tokens=2,
+                )
+            ],
+        )
+        bindings = write_bindings(
+            self.tmp / "identity-bindings.json",
+            {
+                "alpha-usage": _binding("alpha"),
+                "beta-usage": _binding("beta"),
+                "alpha-other": {
+                    "machine": "alpha",
+                    "account": "other@example.test",
+                    "kind": "agy_usage",
+                },
+            },
+        )
+        for binding_id in ("beta-usage", "alpha-other"):
+            with self.subTest(binding_id=binding_id):
+                script = write_fake_ssh(
+                    self.tmp,
+                    name=f"wrong-{binding_id}",
+                    binding_id=binding_id,
+                    bindings_path=bindings,
+                    center_db=self.center,
+                )
+                result = _send(client, bindings, binding_id, self.tmp, script)
+                self.assertNotEqual(result.returncode, 0)
+                combined = (result.stdout + result.stderr).decode()
+                self.assertIn("does not match binding", combined)
+                self.assertFalse(script.with_suffix(".argv.json").exists())
+                self.assertFalse(self.center.exists())
+                self.assertEqual(_pending(client), 1)
+
+        correct = write_fake_ssh(
+            self.tmp,
+            name="correct-identity-ssh",
+            binding_id="alpha-usage",
+            bindings_path=bindings,
+            center_db=self.center,
+        )
+        delivery_json(_send(client, bindings, "alpha-usage", self.tmp, correct))
+        self.assertEqual(_pending(client), 0)
+        self.assertTrue(self.center.exists())
+
     def test_offline_timeout_host_key_and_lost_ack_keep_the_spool_until_retry(self) -> None:
         client = _collect(
             self.tmp,

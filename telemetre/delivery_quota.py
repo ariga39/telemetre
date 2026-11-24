@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .delivery_bindings import Binding, KIND_QUOTA_SAMPLE
+from .replay import ReplayError, validate_ack
 
 PROTOCOL_VERSION = 1
 DEFAULT_QUOTA_MAX_BYTES = 256 * 1024
@@ -276,13 +277,25 @@ def replay_pending(
         except BaseException as exc:
             _mark_attempt(quota_db, batch.sample_id, str(exc))
             raise
-        if ack.get("accepted") != 1:
-            error = f"receiver accepted {ack.get('accepted')!r} of 1 quota observations"
+        try:
+            ack = validate_ack(
+                ack,
+                accepted=1,
+                kind=binding.kind,
+                machine=binding.machine,
+                account=binding.account,
+            )
+            if ack.get("provider") != binding.provider:
+                raise DeliveryQuotaError(
+                    "receiver acknowledgement provider does not match the binding"
+                )
+        except (ReplayError, DeliveryQuotaError) as exc:
+            error = str(exc)
             _mark_attempt(quota_db, batch.sample_id, error)
-            raise DeliveryQuotaError(error)
+            raise DeliveryQuotaError(error) from exc
         batches += 1
         sent += 1
-        duplicates += int(ack.get("duplicates", 0))
+        duplicates += int(ack["duplicates"])
         delivered += _mark_delivered(quota_db, batch.sample_id)
     return {
         "ok": True,

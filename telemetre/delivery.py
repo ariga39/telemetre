@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import quota
 from .delivery_backup import BackupError, online_backup, restore_backup, verify_backup
 from .delivery_bindings import (
     BindingError,
@@ -43,7 +44,13 @@ from .delivery_ssh import (
     SSHConfig,
     SSHTransport,
 )
-from .replay import DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, ReplayError, replay_pending
+from .replay import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_ROWS,
+    ReplayError,
+    replay_pending,
+    spool_identity,
+)
 from .receiver import ProtocolError
 
 
@@ -96,6 +103,15 @@ def _cmd_send(args: argparse.Namespace) -> int:
     binding = require_binding(bindings, args.binding_id)
     if binding.kind != KIND_AGY_USAGE:
         raise DeliveryReceiveError("send requires an agy_usage binding; use send-quota")
+    identity = spool_identity(args.client_db)
+    if identity is None:
+        raise ReplayError("client spool has no machine/account identity")
+    if identity["machine"] != binding.machine or identity["account"] != binding.account:
+        raise ReplayError(
+            "client spool identity "
+            f"{identity['machine']}/{identity['account']} does not match binding "
+            f"{binding.machine}/{binding.account}"
+        )
     result = replay_pending(
         args.client_db,
         _transport(binding, args),
@@ -327,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.handler(args))
     except (BackupError, BindingError, DeliveryQuotaError, DeliveryReceiveError,
             DeliveryTransportError, ProtocolError, ReplayError, ScheduleError,
-            ValueError, sqlite3.Error, OSError) as exc:
+            quota.QuotaError, ValueError, sqlite3.Error, OSError) as exc:
         if args.command == "receive":
             _print_json({"ok": False, "error": public_error(exc)})
         elif getattr(args, "format", "text") == "json":

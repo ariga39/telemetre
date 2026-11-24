@@ -89,6 +89,39 @@ class _LostAckTransport(_DirectTransport):
         raise RuntimeError("acknowledgement lost after commit")
 
 
+class _BadAckTransport:
+    def __init__(self, ack: dict):
+        self.ack = ack
+
+    def send(self, payload: bytes) -> dict:
+        return self.ack
+
+
+class _BadAckAfterCommitTransport(_DirectTransport):
+    def __init__(self, center: Path, bindings, ack: dict):
+        super().__init__(center, bindings)
+        self.ack = ack
+
+    def send(self, payload: bytes) -> dict:
+        self.calls += 1
+        receive_bytes(self.center, self.bindings, "alpha-quota", payload)
+        return self.ack
+
+
+def _valid_ack() -> dict:
+    return {
+        "ok": True,
+        "kind": "quota_sample",
+        "machine": "alpha",
+        "account": "acct@example.test",
+        "provider": "agy",
+        "accepted": 1,
+        "stored": 1,
+        "duplicates": 0,
+        "conflicts": 0,
+    }
+
+
 class QuotaDeliveryTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -184,6 +217,70 @@ class QuotaDeliveryTest(unittest.TestCase):
             )
         finally:
             conn.close()
+
+    def test_bad_ack_counters_keep_the_pending_sample(self) -> None:
+        bad_acks = []
+        for change in (
+            {"stored": None},
+            {"duplicates": None},
+            {"stored": True},
+            {"duplicates": "0"},
+            {"stored": 0, "duplicates": 0},
+            {"accepted": 0, "stored": 0, "duplicates": 0},
+            {"accepted": None},
+            {"ok": False},
+        ):
+            ack = _valid_ack()
+            ack.update(change)
+            bad_acks.append(ack)
+
+        for ack in bad_acks:
+            with self.subTest(ack=ack):
+                with self.assertRaises(DeliveryQuotaError):
+                    replay_pending(
+                        self.local,
+                        _BadAckTransport(ack),
+                        binding=BINDING,
+                    )
+                self.assertIsNotNone(build_next_batch(self.local, BINDING))
+                conn = sqlite3.connect(self.local)
+                try:
+                    delivered = conn.execute(
+                        "SELECT delivered_at FROM delivery_quota_outbox "
+                        "WHERE sample_id = 'sample-1'"
+                    ).fetchone()[0]
+                finally:
+                    conn.close()
+                self.assertIsNone(delivered)
+
+    def test_bad_ack_after_commit_retries_without_duplication(self) -> None:
+        with self.assertRaises(DeliveryQuotaError):
+            replay_pending(
+                self.local,
+                _BadAckAfterCommitTransport(
+                    self.center,
+                    self.bindings,
+                    {"ok": True, "accepted": 1, "stored": 1},
+                ),
+                binding=BINDING,
+            )
+        self.assertIsNotNone(build_next_batch(self.local, BINDING))
+        conn = sqlite3.connect(self.center)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM quota_samples").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
+        result = replay_pending(
+            self.local,
+            _DirectTransport(self.center, self.bindings),
+            binding=BINDING,
+        )
+        self.assertEqual(result["sent_observations"], 1)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertIsNone(build_next_batch(self.local, BINDING))
 
     def test_invalid_window_failure_is_delivered_with_its_category(self) -> None:
         quota.ingest_observation(

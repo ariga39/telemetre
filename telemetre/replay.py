@@ -32,7 +32,7 @@ class ReplayError(RuntimeError):
     """A delivery or acknowledgement failure that must not delete spool rows."""
 
 
-def _validate_ack(
+def validate_ack(
     ack: Any,
     *,
     accepted: int,
@@ -40,6 +40,8 @@ def _validate_ack(
     machine: str,
     account: str,
 ) -> dict[str, Any]:
+    """Validate counters and bound identity before any spool row is released."""
+
     if not isinstance(ack, dict):
         raise ReplayError("receiver acknowledgement rejected: not an object")
     if ack.get("ok") is not True:
@@ -263,7 +265,7 @@ def replay_pending(
     while True:
         batch = build_next_batch(client_db, max_rows=max_rows, max_bytes=max_bytes)
         try:
-            ack = _validate_ack(
+            ack = validate_ack(
                 transport.send(batch.payload),
                 accepted=batch.fact_count,
                 kind=KIND_AGY_USAGE,

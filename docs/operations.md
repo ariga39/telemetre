@@ -167,7 +167,7 @@ python3 -m telemetre.delivery send-quota \
 
 One quota request carries exactly one sample, and the centre ACKs only after the single-sample transaction commits. On timeout or a lost ACK, retransmit the same `sample_id`; the centre is idempotent by sample ID. One local quota database may contain samples for multiple machines, providers, or accounts at the same time; each `send-quota` synchronizes and attempts only samples for the current binding's machine/provider/account, leaving other samples pending.
 
-`--max-bytes` must not exceed the value in the server forced command. The default is 262144 bytes; `send` defaults to at most 1000 agy facts per run, shrinks the batch automatically when over the limit, and retains the queue with an error when a single fact does not fit.
+`--max-bytes` must not exceed the value in the server forced command. The default is 262144 bytes; `send` defaults to at most 1000 agy facts per run, shrinks the batch automatically when over the limit, and retains the queue with an error when a single fact does not fit. Before opening SSH, `send` compares the client spool's stored machine/account with the selected binding; a wrong binding sends nothing and leaves the centre untouched.
 
 ## 4. Scheduling, single instances, and hard timeouts
 
@@ -199,7 +199,9 @@ systemctl --user enable --now telemetre-collect.timer telemetre-quota.timer
 loginctl enable-linger "$USER"
 ```
 
-`telemetre-quota.service` first runs `quota sample --if-due`, then calls `send-quota` separately for `alpha-quota-agy` and `alpha-quota-codex`; each `send-quota` line has a `-` prefix, so a sampling or delivery failure for one provider does not block the other. When one quota database contains multiple machines/providers/accounts, `send-quota` synchronizes and attempts only samples for the current binding tuple (machine/provider/account); other samples remain pending.
+`telemetre-quota.service` first runs `quota sample --if-due` under its own lock and timeout, then calls `send-quota` separately for `alpha-quota-agy` and `alpha-quota-codex`; each line has a `-` prefix, so a sampling or delivery failure for one provider does not block the other. When one quota database contains multiple machines/providers/accounts, `send-quota` synchronizes and attempts only samples for the current binding tuple (machine/provider/account); other samples remain pending.
+
+Each source unit's outer timeout must exceed the sum of its inner budgets. The collect unit allows 900s for collection plus 300s for delivery (1200s total) and sets `TimeoutStartSec=25min` (1500s). The quota unit allows 300s for sampling plus 300s for each provider send (900s total) and sets `TimeoutStartSec=20min` (1200s). Keep a strict margin when editing either value.
 
 Centre installation:
 
@@ -233,7 +235,7 @@ python3 -m telemetre.delivery run --lock <lock> --timeout <seconds> -- <actual c
 
 `run` does two things: `flock` guarantees only one instance per lock; at the deadline it sends TERM/KILL to the whole process group and returns 124. When an instance already exists, a later start prints `skipped: already running` and exits 0 without queuing or collecting twice. systemd's `TimeoutStartSec` is the outer safety net; the inner `--timeout` should be shorter.
 
-See `examples/cron/telemetre.crontab` for the cron equivalent. cron has no systemd `TimeoutStartSec`, so it must use `delivery run --timeout`.
+See `examples/cron/telemetre.crontab` for the cron equivalent. Cron often has no `XDG_RUNTIME_DIR`, so its locks live under `$HOME/.local/state/telemetre/`. Cron has no systemd `TimeoutStartSec`, so collection and quota sampling as well as every delivery call must use `delivery run --timeout`.
 
 ## 5. Health checks and monitoring
 
@@ -253,7 +255,7 @@ Exit codes:
 
 - `0`: all expected sources are healthy.
 - `3`: a source has never reported, a scan reports the source missing, the latest quota attempt failed, or a sample exceeds the freshness threshold.
-- `2`: argument, database, or binding configuration error.
+- `2`: argument, database, binding, or quota-store configuration error.
 
 `--expect-usage` and `--expect-quota` may be repeated. When no expected sources are listed, only usage sources already present at the centre are checked; production monitoring should list every machine/account explicitly, otherwise "never reported" will not be detected. Each JSON item includes fields such as `kind`, `machine`, `account`/`provider`, `reason`, and `last_success`.
 
@@ -279,18 +281,30 @@ Snapshots contain both usage and quota tables (if the centre has written them). 
 
 Restore only writes to a **new path that does not exist**; it never replaces the running database or moves its `-wal`/`-shm`. It installs with an atomic no-clobber link; of two concurrent restores, only one can succeed, and an existing target file stays unchanged.
 
-```bash
-# 1. Stop all timers/services that write to the centre
-sudo systemctl stop telemetre-collect.timer telemetre-quota.timer \
-  telemetre-backup.timer telemetre-health.timer
-sudo systemctl stop telemetre-collect.service telemetre-quota.service
+Before restoring, quiesce the source and centre sides separately:
 
-# 2. Restore to a brand-new path (it must not already exist)
+1. On every source host, stop that user's source timers and services with the user manager:
+   ```bash
+   systemctl --user stop telemetre-collect.timer telemetre-quota.timer
+   systemctl --user stop telemetre-collect.service telemetre-quota.service
+   ```
+   This is not a `sudo systemctl` operation on the centre.
+2. On the centre, stop the centre writers, including the daily quota digest:
+   ```bash
+   sudo systemctl stop telemetre-backup.timer telemetre-health.timer telemetre-quota-daily.timer
+   sudo systemctl stop telemetre-backup.service telemetre-health.service telemetre-quota-daily.service
+   ```
+3. Wait for in-flight SSH deliveries to finish or terminate them. Each accepted delivery is a forced-command receiver process; check with `pgrep -af 'telemetre.delivery receive'` (or `ss`) and do not switch to the restored database until they are gone. A receiver that commits after the snapshot is exactly data that the restore does not contain.
+
+Then restore and verify:
+
+```bash
+# 1. Restore to a brand-new path (it must not already exist)
 python3 -m telemetre.delivery restore \
   --backup /var/backups/telemetre/telemetre-center-....sqlite3 \
   --center-db /var/lib/telemetre/center-restored.sqlite3
 
-# 3. Produce the monthly report and quota history from the restored database, verify them, then switch
+# 2. Produce the monthly report and quota history from the restored database, verify them, then switch
 python3 -m telemetre report --center-db /var/lib/telemetre/center-restored.sqlite3 \
   --month 2026-11 --format json
 python3 -m telemetre.quota report --db /var/lib/telemetre/center-restored.sqlite3 --json
@@ -298,15 +312,18 @@ python3 -m telemetre.quota report --db /var/lib/telemetre/center-restored.sqlite
 
 After verification, change `CENTER_DB` in `/etc/telemetre/center.env` to the new path (also update `--center-db` in the server forced commands), reload, and start the timers. Keep the old database as-is for post-incident inspection or manual archiving; cleanup is an explicit operator action. If the restore target already exists, the command fails without overwriting.
 
-Restore only returns to the latest successful snapshot. Centre writes after that snapshot are lost; the client pending queues and agy source logs remain, so collection and replay can catch up, and replay is idempotent by fact key and sample ID.
+Restore only returns to the latest successful snapshot. Distinguish two kinds of post-snapshot data:
+
+- Items still pending on clients (usage `pending` rows or quota outbox rows not marked delivered) are retried automatically after the restored centre is active, and idempotency prevents double counting.
+- Items the centre ACKed after the snapshot are not in the snapshot and are **not replayed automatically**: the client removed the usage pending rows or marked the quota outbox delivered only after that ACK. Retained agy source logs or the original local quota database may permit an explicit, operator-driven recovery, but this guide does not promise that every ACKed post-backup item can be reconstructed. Treat the snapshot as the recovery point.
 
 ## 8. Retry, acknowledgement, and recovery semantics
 
-- Clients delete `pending` (usage) or mark the outbox delivered (quota) only after receiving a valid ACK. Timeout, host-key failure, non-zero exit, non-JSON ACK, identity mismatch, and oversized output all retain the pending item.
+- Clients delete `pending` (usage) or mark the outbox delivered (quota) only after receiving a valid ACK. Timeout, host-key failure, non-zero exit, non-JSON ACK, missing or non-integer ACK counters, an inconsistent `stored + duplicates != accepted`, identity mismatch, and oversized output all retain the pending item.
 - Centre usage receive emits its ACK only after the transaction commits; quota receive calls `ingest_observation` for one sample and ACKs only after the single-sample transaction commits. `duplicates` after a lost ACK means only a duplicate; it does not increase counts.
 - Request bodies have row and byte limits; the server reads `max_bytes + 1` first and rejects the entire batch when over the limit. A bad usage line/batch does not write partial events.
 - When host-key verification fails, do not disable `StrictHostKeyChecking`; verify the new fingerprint out of band and update the pinned `known_hosts`.
-- While offline, the client keeps collecting into local SQLite; after centre recovery it replays in order. Once source logs are cleaned up, facts that were never staged cannot be recovered.
+- While offline, the client keeps collecting into local SQLite; after centre recovery, items still pending replay in order. Once source logs are cleaned up, facts that were never staged cannot be recovered.
 
 ## 9. Security boundary
 
