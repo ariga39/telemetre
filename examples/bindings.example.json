@@ -1,0 +1,26 @@
+{
+  "bindings": {
+    "alpha-usage": {
+      "machine": "alpha",
+      "account": "personal@example.test",
+      "kind": "agy_usage"
+    },
+    "alpha-quota-agy": {
+      "machine": "alpha",
+      "account": "personal@example.test",
+      "kind": "quota_sample",
+      "provider": "agy"
+    },
+    "alpha-quota-codex": {
+      "machine": "alpha",
+      "account": "personal@example.test",
+      "kind": "quota_sample",
+      "provider": "codex"
+    },
+    "beta-usage": {
+      "machine": "beta",
+      "account": "personal@example.test",
+      "kind": "agy_usage"
+    }
+  }
+}

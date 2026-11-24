@@ -1,64 +1,64 @@
-# telemetre 设计
+# telemetre design
 
-telemetre 回答两个问题：各台机器上的 Antigravity CLI（agy）在一个月里用了多少 token？同一时期，agy 和 Codex 订阅的各个额度窗口还剩多少、什么时候刷新？第一版交付命令行报表，中心只保存计量数据。已有 debitmetre 继续负责经过其中心代理的 Codex 请求计量。本设计不把 Codex token、ChatGPT 普通聊天或等效美元估价计入 agy 用量。
+telemetre answers two questions: how many tokens did the Antigravity CLI (agy) on each machine use in a month, and how much of each quota window for agy and Codex subscriptions remains during the same period and when does it reset? The first version delivers command-line reports, and the centre stores only metering data. The existing debitmetre continues to meter Codex requests that pass through its central proxy. This design does not count Codex tokens, ordinary ChatGPT chat, or equivalent dollar estimates toward agy usage.
 
-## 部署与数据流
+## Deployment and data flow
 
-采用定时批处理。每个 agy 客户端运行采集命令，通过 SSH 把计量行发给一台中心主机。每个 provider/account 另指定一台已登录的机器负责采配额，可以兼任客户端。中心只有一个 SQLite 数据库；运行报告命令无需访问各台机器或登录模型服务。采集程序退出不会中断用户的模型调用。建议首版用 Python 3 标准库、系统 SSH 和系统定时器，无常驻 Web 服务。
+Use scheduled batch processing. Each agy client runs a collection command and sends metering rows to one central host over SSH. For each provider/account, designate another logged-in machine to sample quota; it may also be a client. The centre has exactly one SQLite database; running report commands requires neither access to the machines nor a login to model services. Exiting the collector does not interrupt the user's model calls. For the first version, use the Python 3 standard library, system SSH, and system timers, with no long-running web service.
 
-每台机器配置稳定别名和账号别名，每个 SSH 公钥在中心绑定获准写入的机器、账号和数据类型；额度写入权只给指定采样机。用专用 SSH 用户、受限公钥（强制执行接收命令、禁用转发及终端）和固定主机公钥。
+Configure a stable alias for each machine and account. At the centre, bind each SSH public key to the machines, accounts, and data kinds it may write; quota write permission is granted only to the designated sampling machine. Use a dedicated SSH user, restricted public keys (forced receive command, forwarding and terminal disabled), and pinned host public keys.
 
-接收端从认证映射确定归属，校验版本、时间、字段类型和非负计数，单批设行数及字节上限，事务提交后才确认。正文、提示、工具参数、环境变量、OAuth/API 凭据均不进入传输或报表。各定时作业实施单实例运行及硬超时，SSH 非交互连接；中心写锁有限等待，超时保留本地队列重试。
+The receiver determines attribution from the authenticated binding, validates version, time, field types, and non-negative counts, and sets per-batch row and byte limits; it acknowledges only after the transaction commits. Message bodies, prompts, tool arguments, environment variables, and OAuth/API credentials never enter transport or reports. Each scheduled job runs as a single instance with a hard timeout and uses a non-interactive SSH connection; centre write locks wait for a bounded time, and on timeout the local queue is retained for retry.
 
-机器改名沿用稳定标识；切换订阅账号时应使用独立 CLI 配置目录并单独绑定，可用不同操作系统用户隔离登录。已有混合目录使用独立的非空未归属标识，留在未归属报表。
+Machine renames preserve the stable identifier. When switching subscription accounts, use a separate CLI configuration directory and a separate binding; different operating-system users can isolate logins. Existing mixed directories use a distinct non-empty unattributed identifier and remain in the unattributed report.
 
-中心 SQLite 每日使用在线备份接口写入独立存储；检查备份完整性，验收时用备份恢复月报及窗口历史。中心故障后最多损失上次备份以来的快照，保留的 agy 源日志可重扫回补。
+The centre's SQLite database is copied daily to independent storage through the online backup interface; verify backup integrity, and during acceptance restore monthly reports and window history from a backup. After a centre failure, at most the snapshots since the last backup are lost; retained agy source logs can be rescanned to backfill.
 
-## agy 跨机器用量
+## agy usage across machines
 
-在每个配置的本地 agy 数据根下扫描 brain/<conversation-id>/.system_generated/logs/transcript.jsonl。首次扫描可以回补保留的历史。读取完整 JSON 行中的 step_index、created_at、model、input_tokens、cache_read_tokens、output_tokens。三列均按客户端原值单列合计，缺值与显式零分开；输入、缓存读和输出的统计口径随源版本记录，不从正文估算推理或缺失计数。有模型步骤而缺计数时记录覆盖缺口；纯工具和用户消息不算模型调用。保存 UTC 事件时间，月份使用左闭右开的 UTC 区间，按日志 created_at 归月；采集和上传时间只用于运维。报表打印所用时区，指定 --tz 可按所选时区的日历月计算起止时刻，再转换为 UTC 查询。
+Scan `brain/<conversation-id>/.system_generated/logs/transcript.jsonl` under each configured local agy data root. The first scan can backfill retained history. Read `step_index`, `created_at`, `model`, `input_tokens`, `cache_read_tokens`, and `output_tokens` from complete JSON lines. Sum each of the three columns separately using the client's original values; keep missing values distinct from explicit zero. Record the accounting basis for input, cache read, and output with the source version; do not estimate reasoning or missing counts from message text. When a model step lacks counts, record a coverage gap; tool-only and user messages are not model calls. Store UTC event time, use left-closed, right-open UTC ranges for months, and assign months by the log's `created_at`; collection and upload times are for operations only. Reports print the timezone used; `--tz` computes the calendar-month boundaries in the selected timezone and converts them to UTC for querying.
 
-首版按文件身份、大小和纳秒修改时间跳过未变化文件；有变化就重读。客户端保留每个已观察事实的键与计量字段摘要，只有新增或变化的事实入队。文件扫描进度、摘要与待发事实在同一本地事务中提交；失败回滚后可重读。重试发送同一版本时，中心按事实键和内容幂等处理。先读到完整换行，末尾半行下次重试；中间坏行计入采集诊断，继续处理后续行。源文件若被删除，只能保留已上传或暂存的数据。
+The first version skips unchanged files by file identity, size, and nanosecond modification time; re-read any changed file. The client retains the key and metering-field digest of every observed fact, and queues only new or changed facts. File scan progress, digests, and pending facts commit in the same local transaction; after a rollback the files can be re-read. When the same version is retried, the centre handles it idempotently by fact key and content. Read only complete lines; retain a trailing partial line for the next attempt; count malformed lines in the middle as collection diagnostics and continue with later lines. If a source file is deleted, only data already uploaded or staged can be retained.
 
-将解析出的最少字段先写入本机 SQLite 待发送表，按有限批次重试，收到中心确认才删除。采集与投递各自推进。
+Write the minimal parsed fields to the local SQLite pending table first, retry in bounded batches, and delete only after receiving a centre acknowledgement. Collection and delivery advance independently.
 
-中心 agy 事件以（账号、会话 ID、步骤编号）唯一，同一历史复制到另一台机器或确认丢失后重传均只计一次。首次来源是机器归属的观测依据，遇到多个来源则保留来源集合并标为归属不明，从单机排名分离，账号总数只计一次。同键不同计数标成冲突并从已知合计隔离，保留两份结构化证据；只补齐此前为空的字段可以合并。
+At the centre, agy events are unique by (account, conversation ID, step index); the same history copied to another machine or re-sent after a confirmed loss is counted only once. The first source is the observational basis for machine attribution; when multiple sources appear, keep the source set and mark the event as unattributed, separating it from single-machine rankings while counting it only once in account totals. Different counts under the same key are marked as a conflict and isolated from known totals, retaining both pieces of structured evidence; fields that were previously empty may be filled in and merged.
 
-每次运行即使没有新步骤也上报扫描状态、坏行数、缺计数和积压；状态检查在预期来源缺报或采样连续失败时返回非零，可由现有监控调用。报表给出缺失、冲突和最近成功扫描时间；无法从本地记录推断服务端后台调用或未落盘请求。
+Every run reports scan status, bad-line count, missing counts, and backlog even when there are no new steps; the status check returns non-zero when an expected source is missing or sampling fails repeatedly, so existing monitoring can call it. Reports show missing data, conflicts, and the last successful scan time; server-side background calls or requests that never reached disk cannot be inferred from local records.
 
-## 两个账号额度采样器
+## Two subscription quota samplers
 
-两种来源独立配置采样间隔；起始建议每 15 分钟一次，经切片二验证后可调至 5 分钟，记录实际读取时间。模型组、窗口数量和时长都以返回为准。首次部署即从当前读数开始；无需用户提供余额、开窗时间或手动校准。
+Configure sampling intervals independently for the two sources; start with one sample every 15 minutes. After verification, the interval can be reduced to 5 minutes. Record the actual read time. Model groups, window counts, and durations follow the returned data. Start from the current reading on first deployment; users need not provide balances, window start times, or manual calibration.
 
-| 来源 | 读取途径 | 持久化口径 |
+| Source | Read path | Persistence basis |
 | --- | --- | --- |
-| agy | 已登录 CLI 运行 `agy -p /usage --output-format json`，要求成功状态，读取 command.data.groups[].buckets[] | 保存组名、bucket.id、window、remaining_fraction、reset_time。取 JSON 数值保留小数，避免用展示百分比。 |
-| Codex | 通过本机 `codex app-server` stdio 完成 initialize / initialized 握手，发送只读 account/rateLimits/read 并按请求 id 取响应 | 优先 rateLimitsByLimitId，缺失或空映射时使用有效的 rateLimits；保留 limitId 和 primary/secondary 槽位、windowDurationMins、usedPercent、resetsAt。双视图同时存在只取一份。时长按值解释，例如 10080 分钟是 7 天；缺字段标未知。 |
+| agy | Run `agy -p /usage --output-format json` in the logged-in CLI, require a success status, and read `command.data.groups[].buckets[]` | Store group name, `bucket.id`, `window`, `remaining_fraction`, `reset_time`. Keep JSON numbers as decimals; avoid display percentages. |
+| Codex | Complete the `initialize` / `initialized` handshake over the local `codex app-server` stdio, send the read-only `account/rateLimits/read` request, and match the response by request id | Prefer `rateLimitsByLimitId`; when it is missing or an empty mapping, use a valid `rateLimits`. Preserve `limitId` and the primary/secondary slot, `windowDurationMins`, `usedPercent`, `resetsAt`. When both views exist, keep only one. Interpret durations by value, for example 10080 minutes is 7 days; mark missing fields unknown. |
 
-统一展示剩余百分比：agy 为 100 × remaining_fraction，Codex 为 100 − usedPercent。存源数值及单位以便复核；越界值标异常。agy 刷新时刻按 RFC3339、Codex 按 Unix 秒转 UTC 并保留原值；超额读数保留原值，剩余显示下限为零。刷新时间缺失或为零显示未知，刷新时间漂移时保守断开比较。
+Display remaining percentages uniformly: agy is 100 × `remaining_fraction`; Codex is 100 − `usedPercent`. Store source values and units for review; mark out-of-range values anomalous. Convert agy reset times from RFC3339 and Codex reset times from Unix seconds to UTC, preserving the original value; retain overage readings as-is and floor the displayed remaining value at zero. Show unknown when the reset time is missing or zero, and conservatively break comparisons when reset times drift.
 
-每次运行生成稳定的样本 ID 连同 provider、账号、UTC 采样时间和全部桶作为一份样本暂存，重传沿用原 ID。一个账号在多台机器上看到的余额不能相加。请求超时、退出码错误、CLI 要求重新登录、结构无法识别均作为失败观测；不把失败变成 0% 或 100%。只有完整响应可替换最新成功快照，返回缺失的可选字段照原样标未知。空桶集合标“未返回窗口”。
+Each run generates a stable sample ID and stages the provider, account, UTC sampling time, and all buckets as one sample; retries reuse the original ID. Balances seen for one account on multiple machines must not be added together. Request timeouts, non-zero exit codes, CLI requests to log in again, and unrecognized structures are failure observations; never turn a failure into 0% or 100%. Only a complete response may replace the latest successful snapshot; optional fields missing from the response remain unknown. An empty bucket set is marked "no windows returned".
 
-报告按采样端的观测时刻排序，另存中心接收时间；断网重放旧样本不能覆盖更新的成功或失败状态。采样端和中心使用系统时间同步，时间异常的样本标记出来。最近一次尝试状态与上次成功时间分别展示；超过两个采样周期标陈旧，显示上次读数及时间。重置时间经过但新样本未到时显示“待刷新确认”。
+Reports sort by the sampling side's observation time and separately store the centre receive time; replaying old samples after an outage must not overwrite a newer success or failure state. Sampling side and centre use synchronized system time, and samples with abnormal time are marked. Show the latest attempt status and last success time separately; mark stale after more than two sampling intervals, showing the last reading and its time. When a reset time has passed but no new sample has arrived, show "awaiting reset confirmation".
 
-## 用户看到的报告
+## Reports the user sees
 
-- 用量报告按指定月份列出 agy 每台机器、每个模型的三类 token、计量步骤数与按列的账号合计。三列分别对账，附机器归属不明行；不生成跨列总 token。推理覆盖依源版本标为已验证或未知，不将 reasoning 另行叠加。输出显示 UTC 范围、已配置来源、最后扫描和缺口；离线或未配置设备的真实用量无法推断。
-- 配额报告按账号、服务和窗口列最新剩余百分比、刷新时刻、采样时刻和新鲜度。历史报告给出指定区间内最低观测余额及观测时间；相同窗口连续采到零只算一个观测到的触底段。跨缺测区间不推断触底次数、时间或余额。按同一桶与同一刷新时刻可比较净变化；窗口刷新、标识变化或采样中断时断开比较。并发机器的账号扣量无法精确拆分。
-- 历史窗口只从已保存快照回放；历史 agy 日志只能补 token。中心定时器每日生成一次带日期的额度摘要（各窗口最新值、当日最低值、最近成功时间及缺测），可直接用 CLI 查看。用户可据实际用量、低余额和触底频次判断订阅价值。报表按账号分别解读。
+- The usage report lists, for the selected month, the three token columns and counted steps for each agy machine and model, plus per-column account totals. Reconcile the three columns separately and include a row for machines with unknown attribution; do not produce a cross-column total token count. Mark reasoning coverage as verified or unknown according to the source version, and never add reasoning as another column. The output shows the UTC range, configured sources, last scan, and gaps; true usage from offline or unconfigured devices cannot be inferred.
+- The quota report lists the latest remaining percentage, reset time, sampling time, and freshness by account, service, and window. Historical reports give the lowest observed remaining balance and its observation time within the selected range; consecutive samples of zero for the same window count as one observed bottom segment. Do not infer bottom counts, times, or balances across gaps in sampling. Net change is comparable for the same bucket and the same reset time; break the comparison when the window resets, the identifier changes, or sampling is interrupted. Usage deductions from concurrent machines cannot be attributed exactly.
+- Historical windows are replayed only from stored snapshots; historical agy logs can only backfill tokens. A centre timer generates a dated quota summary once a day (latest value per window, daily minimum, latest success time, and missing measurements), which can be viewed directly with the CLI. Users can judge subscription value from actual usage, low balances, and bottom frequency. Interpret reports per account.
 
-## 实施顺序与验收
+## Implementation order and acceptance
 
-每个切片先通过真实入口写出失败的行为测试，再做最小实现。日志未标注生产版本时保留未知，仅记录采集器版本。切片一实测 fork/rewind 是否复制前缀或复用步骤编号；若存在，利用可验证的父引用排除复制前缀，无法区分的分支标为覆盖不确定，未经核验不声称精确。
+Each slice first writes a failing behavioral test through the real entry point, then implements the minimum. When a log has no production version marker, keep it unknown and record only the collector version. Slice one empirically checks whether fork/rewind copies prefixes or reuses step indices; if so, use verifiable parent references to exclude copied prefixes, and mark indistinguishable branches as coverage-uncertain; do not claim precision without verification.
 
-切片二检查定时调用 /usage 的日志增长、会话目录副作用和运行时间，并测试与活跃会话同时采样，再确定线上采样频率。使用合成数据和隔离账号别名，真实账号仅用于可选的本机只读对账。
+Slice two checks log growth, session-directory side effects, and runtime when `/usage` is called on a schedule, and tests sampling concurrently with an active session before fixing the online sampling frequency. Use synthetic data and isolated account aliases; real accounts are used only for optional local read-only reconciliation.
 
-1. 两个目录各有一个独立会话，跨 UTC 月界，上月发生而本月上传仍归上月。重传、复制会话、重启、半行补全及冲突后，月报显示预期总数、月份和归属。断网后收集，源日志清理，再联网应能提交已暂存的事实；确认响应丢失后重传不增量。
-2. 用合成 agy 响应和 Codex stdio 对端验证两个入口，覆盖多模型组、仅周窗、双视图、空桶、零余额、缺字段、超时、登录失效与跨重置。一次模型服务采样失败时另一服务仍出数。额外用已登录客户端对照一次窗口原值、显示比例和刷新时刻。
-3. 在两台主机完成采集、SSH 投递、中心报表的闭环。校验 A 的身份不能写 B 的数据，输入中额外的会话正文不会被持久化；并发提交和断连重试能得到同一最终计数。以一个真实会话和本地 SQLite 用量字段交叉核验，并记录该版本及样本覆盖范围。
+1. Each of two directories has an independent session spanning the UTC month boundary; an event from the previous month still belongs to that month when uploaded in the current month. After retransmission, copied sessions, restarts, half-line completion, and conflicts, the monthly report shows the expected totals, months, and attribution. Collect while offline, delete the source logs, then reconnect and submit the staged facts; after a lost acknowledgement, retransmission must not increase counts.
+2. Validate both entry points with synthetic agy responses and a Codex stdio peer, covering multiple model groups, weekly-only windows, both views, empty buckets, zero balance, missing fields, timeouts, invalid login, and crossings of resets. When one model service sampling fails, the other service still produces data. Additionally compare one window's source value, display percentage, and reset time against a logged-in client.
+3. Complete collection, SSH delivery, and centre reporting across two hosts. Verify that A's identity cannot write B's data, and that extra conversation text in the input is not persisted; concurrent submissions and retries after disconnects must reach the same final counts. Cross-check one real session against the local SQLite usage fields and record that version and the sample coverage.
 
-## 依据及待验证范围
+## Basis and open verification
 
-agy 1.5.16 的本地只读抽样覆盖四个会话，101 个有计数步骤逐条与 SQLite 相应三列一致；这是两种本地表示的一致性证据。该版本的 /usage 实测含分组、比例和刷新时间。Codex CLI 0.172.0 的本地事件能看到额度窗口，但事件只随活动落盘；定时采样选用官方 app-server 读取路径，在该版本已用登录身份通过 stdio 握手和只读 RPC 收到 rateLimitsByLimitId，以及一个含 usedPercent、windowDurationMins、resetsAt 的周窗口。第二个切片以合成数据验证其他返回形态。桌面端、远端执行且未落盘的 agy 任务、旧版日志需要另外核对覆盖。
+Local read-only sampling of agy 1.5.16 covered four sessions; 101 counted steps matched the corresponding three columns in SQLite one by one; this is evidence that the two local representations agree. The `/usage` command in that version was observed to include groups, fractions, and reset times. Codex CLI 0.172.0's local events expose quota windows, but events are written to disk only with activity; scheduled sampling uses the official app-server read path, which in that version completed the stdio handshake and a read-only RPC with a logged-in identity and received `rateLimitsByLimitId` plus a weekly window containing `usedPercent`, `windowDurationMins`, and `resetsAt`. Slice two validates other response shapes with synthetic data. Desktop clients, remotely executed agy tasks that never reach disk, and older logs require separate coverage checks.
 
-参考：[Antigravity hooks](https://antigravity.google/docs/hooks)、[agy 额度](https://antigravity.google/docs/cli/commands/usage)、[订阅规则](https://antigravity.google/docs/plans)、[Codex App Server](https://developers.openai.com/codex/app-server)、[debitmetre](https://github.com/ariga39/debitmetre)。
+References: [Antigravity hooks](https://antigravity.google/docs/hooks), [agy quota](https://antigravity.google/docs/cli/commands/usage), [subscription rules](https://antigravity.google/docs/plans), [Codex App Server](https://developers.openai.com/codex/app-server), [debitmetre](https://github.com/ariga39/debitmetre).

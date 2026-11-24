@@ -1,0 +1,18 @@
+[Unit]
+Description=telemetre: collect agy usage and deliver pending facts (user)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/opt/telemetre
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/telemetre/telemetre.env
+StateDirectory=telemetre
+RuntimeDirectory=telemetre
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=25min
+ExecStart=/usr/bin/python3 -m telemetre.delivery run --lock %t/telemetre/collect.lock --timeout 900 -- /usr/bin/python3 -m telemetre collect --client-db %S/telemetre/client.sqlite3 --machine ${MACHINE} --account ${ACCOUNT} --root %h/.gemini/antigravity-cli
+ExecStart=/usr/bin/python3 -m telemetre.delivery run --lock %t/telemetre/delivery.lock --timeout 300 -- /usr/bin/python3 -m telemetre.delivery send --client-db %S/telemetre/client.sqlite3 --bindings %h/.config/telemetre/bindings.json --binding-id ${BINDING_ID_USAGE} --ssh-host ${SSH_HOST} --ssh-user ${SSH_USER} --identity %h/.ssh/telemetre_usage --known-hosts %h/.ssh/telemetre_known_hosts

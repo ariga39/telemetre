@@ -1,0 +1,19 @@
+[Unit]
+Description=telemetre: expected-source health check
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=telemetre
+Group=telemetre
+Environment=PYTHONPATH=/opt/telemetre
+EnvironmentFile=/etc/telemetre/center.env
+StateDirectory=telemetre
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/telemetre
+TimeoutStartSec=2min
+ExecStart=/usr/bin/python3 -m telemetre.delivery check --center-db ${CENTER_DB} --expect-usage ${EXPECTED_USAGE} --expect-quota ${EXPECTED_QUOTA_AGY} --expect-quota ${EXPECTED_QUOTA_CODEX} --max-age-seconds ${MAX_AGE_SECONDS} --format json

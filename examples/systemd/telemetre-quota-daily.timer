@@ -1,0 +1,12 @@
+[Unit]
+Description=telemetre: store yesterday's quota digest
+After=local-fs.target
+
+[Timer]
+OnCalendar=*-*-* 00:17:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=telemetre-quota-daily.service
+
+[Install]
+WantedBy=timers.target

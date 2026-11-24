@@ -1,0 +1,19 @@
+[Unit]
+Description=telemetre: online centre backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=telemetre
+Group=telemetre
+Environment=PYTHONPATH=/opt/telemetre
+EnvironmentFile=/etc/telemetre/center.env
+StateDirectory=telemetre
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/telemetre /var/backups/telemetre
+TimeoutStartSec=10min
+ExecStart=/usr/bin/python3 -m telemetre.delivery backup --center-db ${CENTER_DB} --dest ${BACKUP_DIR}

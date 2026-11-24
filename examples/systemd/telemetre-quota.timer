@@ -1,0 +1,13 @@
+[Unit]
+Description=telemetre: sample quota windows (every 15 minutes)
+Wants=network-online.target
+After=network-online.target
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60s
+Unit=telemetre-quota.service
+
+[Install]
+WantedBy=timers.target
