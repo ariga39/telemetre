@@ -877,7 +877,7 @@ def collect_observation(
             interval_seconds=source.interval_seconds,
             sample_id=sample_id or uuid.uuid4().hex,
         )
-    return Observation(
+    success = Observation(
         provider=source.provider,
         account=source.account,
         machine=machine,
@@ -888,6 +888,25 @@ def collect_observation(
         interval_seconds=source.interval_seconds,
         sample_id=sample_id or uuid.uuid4().hex,
     )
+    try:
+        # The success model must satisfy the same validity contract as an
+        # ingested/replayed observation.  Otherwise a finite source value that
+        # overflows a derived field would escape the per-source failure
+        # boundary and abort later providers during storage.
+        _validate_observation(success)
+    except (TypeError, ValueError):
+        return Observation(
+            provider=source.provider,
+            account=source.account,
+            machine=machine,
+            sampled_at=timestamp,
+            status="failure",
+            error_kind="invalid_observation",
+            error_detail="provider response did not satisfy the observation contract",
+            interval_seconds=source.interval_seconds,
+            sample_id=sample_id or uuid.uuid4().hex,
+        )
+    return success
 
 
 # ---------------------------------------------------------------------------

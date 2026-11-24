@@ -13,7 +13,7 @@ fixtures in temporary directories.
 
 ## Requirements and files
 
-- Python 3.10 or newer.
+- Python 3.11 or newer.
 - `telemetre/quota.py` — the complete sampler and CLI.
 - `tests/test_quota*.py` — behavioral tests, including synthetic `agy` and
   `codex app-server` peers.
@@ -90,8 +90,10 @@ tests and replay checks), and `--json`.
   minutes) instead of tying collection to a model call.
 - `report` prints the latest successful snapshot per account, plus the latest
   attempt status. With `--date`, it prints observations from that local
-  calendar day. `report --check` exits 3 when a configured account is missing,
-  stale, or its latest attempt failed; use it from monitoring.
+  calendar day. `report --check` exits 3 when an **expected** account is
+  missing, stale, or its latest attempt failed. When a config is supplied, only
+  accounts still configured are expected; accounts retained in the database
+  after removal stay visible as history but do not make the check fail.
 - `daily` builds the same dated summary and stores it by `(day, timezone)`.
   Re-running for the same day updates the one stored row. Without `--date`, it
   targets yesterday in the report timezone.
@@ -165,7 +167,9 @@ The response view is chosen as follows:
 
 For each limit the report keeps `limitId` and the `primary`/`secondary` slots.
 For each slot it keeps `windowDurationMins`, `usedPercent`, and `resetsAt`.
-Durations are interpreted as minutes (`10080` is seven days). `usedPercent` is
+Durations are interpreted as minutes (`10080` is seven days). A negative
+`windowDurationMins` is a malformed source response and is recorded as a failed
+observation; it does not replace the last complete snapshot. `usedPercent` is
 kept as the source value and displayed as `100 − usedPercent`, floored at `0%`
 for overage; out-of-range values are flagged. `resetsAt` is Unix seconds,
 converted to UTC, and the original value is retained. Missing optional fields
@@ -175,8 +179,9 @@ empty recognized result is a successful observation with no windows.
 ## Failure semantics
 
 A timeout, spawn error, non-zero exit, re-login/authentication message,
-non-JSON output, unrecognized envelope, malformed bucket/slot, or non-finite
-number is a **failure observation**:
+non-JSON output, unrecognized envelope, malformed bucket/slot, non-finite
+number, or a finite source number whose derived display overflows (for example
+`remaining_fraction: 1e308`) is a **failure observation**:
 
 - it is stored with a stable sample id and a short generic error kind/detail;
 - it carries no partial buckets;
@@ -236,6 +241,9 @@ Dated report:
 - reset changes create separate window histories;
 - missing intervals are reported explicitly, including a partial current day
   ending at report time;
+- dated freshness is evaluated at the requested period end (or report time for
+  a partial current day), not at the wall clock when the report is viewed, so
+  yesterday's complete summary can remain fresh;
 - reports are per account; concurrent machine deductions are not split.
 
 `daily` stores the dated summary with the latest value, daily minimum, last
@@ -264,6 +272,9 @@ for observation in iter_observations(
 ):
     payload = observation.to_dict()   # schema telemetre.quota.observation.v1
     # send payload over the authenticated delivery channel
+
+# Observation.from_dict(payload) validates the shape and raises ValueError for
+# non-list windows or invalid window rows, rather than leaking AttributeError.
 
 is_new = ingest_observation(center_db, payload, received_at=None)
 # False means an idempotent replay. Raises ObservationConflict if the same

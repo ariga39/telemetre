@@ -166,6 +166,97 @@ class AgySamplingTest(unittest.TestCase):
             [("Gemini", "five-hour"), ("Claude", "weekly"), ("Claude", "monthly")],
         )
 
+class AgyPercentOverflowTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "quota.sqlite3"
+
+    def test_finite_fraction_overflow_is_a_failure_and_later_sources_continue(self):
+        def agy_payload(remaining):
+            return {
+                "status": "success",
+                "command": {
+                    "data": {
+                        "groups": [
+                            {
+                                "name": "Gemini",
+                                "buckets": [
+                                    {
+                                        "id": "weekly",
+                                        "window": "7d",
+                                        "remaining_fraction": remaining,
+                                        "reset_time": "2026-01-08T00:00:00Z",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+            }
+
+        agy = write_fake_agy(self.tmp, payload=agy_payload(0.5))
+        codex = write_fake_codex(
+            self.tmp,
+            result={
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "usedPercent": 10,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1767225600,
+                        }
+                    }
+                }
+            },
+        )
+        config = write_config(
+            self.tmp,
+            [
+                source("agy", "personal", agy),
+                source("codex", "work", codex),
+            ],
+            database=self.db,
+        )
+        first = run_cli(
+            "sample", "--config", config, "--now", "2026-01-01T00:00:00Z", "--json"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        write_fake_agy(self.tmp, payload=agy_payload(1e308))
+        second = run_cli(
+            "sample", "--config", config, "--now", "2026-01-01T00:15:00Z", "--json"
+        )
+        self.assertEqual(second.returncode, 1, second.stderr)
+        outcomes = {item["provider"]: item for item in json_output(second)["sampled"]}
+        self.assertEqual(outcomes["agy"]["status"], "failure")
+        self.assertEqual(outcomes["agy"]["error"]["kind"], "invalid_observation")
+        self.assertEqual(outcomes["codex"]["status"], "success")
+
+        report = json_output(
+            run_cli(
+                "report",
+                "--config",
+                config,
+                "--now",
+                "2026-01-01T00:16:00Z",
+                "--json",
+            )
+        )
+        accounts = {item["provider"]: item for item in report["accounts"]}
+        self.assertEqual(accounts["agy"]["last_attempt"]["status"], "failure")
+        self.assertEqual(
+            accounts["agy"]["last_success"]["sampled_at"], "2026-01-01T00:00:00Z"
+        )
+        self.assertEqual(
+            accounts["agy"]["windows"][0]["remaining"]["display_percent"], 50.0
+        )
+        self.assertEqual(
+            accounts["codex"]["last_attempt"]["sampled_at"], "2026-01-01T00:15:00Z"
+        )
+
+
 class CodexInvalidDurationTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
