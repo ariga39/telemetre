@@ -28,7 +28,12 @@ def parse_rfc3339(value: str) -> datetime:
         raise ValueError(f"invalid RFC3339 timestamp: {value!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        # Offsets can push year 1 or year 9999 outside datetime's UTC range.
+        # Callers treat this the same as any other invalid timestamp.
+        raise ValueError(f"timestamp outside representable UTC range: {value!r}") from exc
 
 
 def to_us(value: datetime) -> int:
@@ -42,9 +47,11 @@ def from_us(value: int) -> datetime:
 
 def utc_text(value: datetime | int) -> str:
     moment = from_us(value) if isinstance(value, int) else value.astimezone(timezone.utc)
-    if moment.microsecond:
-        return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    timespec = "microseconds" if moment.microsecond else "seconds"
+    text = moment.isoformat(timespec=timespec)
+    if text.endswith("+00:00"):
+        return text[:-6] + "Z"
+    return text
 
 
 def parse_month(value: str) -> tuple[int, int]:

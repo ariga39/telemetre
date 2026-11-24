@@ -230,6 +230,97 @@ class SpoolDiagnosticsTest(unittest.TestCase):
                 "model_steps": 2,
             })
 
+    def test_out_of_range_utc_conversion_is_bad_line_and_later_step_survives(self) -> None:
+        cases = (
+            ("lower", "0001-01-01T00:00:00+01:00"),
+            ("upper", "9999-12-31T23:59:59-01:00"),
+        )
+        for label, bad_time in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                root = base / "root"
+                client = base / "client.sqlite"
+                center = base / "center.sqlite"
+                write_transcript(
+                    root,
+                    f"conv-time-edge-{label}",
+                    [
+                        model_step(
+                            0,
+                            bad_time,
+                            input_tokens=999,
+                            cache_read_tokens=99,
+                            output_tokens=9,
+                        ),
+                        model_step(
+                            1,
+                            "2026-11-25T00:00:00Z",
+                            input_tokens=10,
+                            cache_read_tokens=1,
+                            output_tokens=2,
+                        ),
+                    ],
+                )
+                collected = _collect(base, root, client)
+                self.assertEqual(collected["bad_lines"], 1)
+                self.assertEqual(collected["new_facts"], 1)
+                _replay(base, client, center)
+                account = _report(center)["accounts"]["acct"]
+                self.assertEqual(account["account_total"], {
+                    "input_tokens": 10,
+                    "cache_read_tokens": 1,
+                    "output_tokens": 2,
+                    "model_steps": 1,
+                })
+
+    def test_low_year_utc_event_round_trips_through_spool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            write_transcript(
+                root,
+                "conv-low-year",
+                [
+                    model_step(
+                        0,
+                        "0001-01-01T00:00:00Z",
+                        input_tokens=7,
+                        cache_read_tokens=3,
+                        output_tokens=1,
+                    )
+                ],
+            )
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["bad_lines"], 0)
+            pending = json.loads(run_cli("pending", "--client-db", str(client)).stdout)
+            self.assertEqual(pending["facts"][0]["event_time"], "0001-01-01T00:00:00Z")
+            _replay(base, client, center)
+            report = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "0001-01",
+                    "--tz",
+                    "UTC",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(report["utc_start"], "0001-01-01T00:00:00Z")
+            self.assertEqual(
+                report["accounts"]["acct"]["account_total"],
+                {
+                    "input_tokens": 7,
+                    "cache_read_tokens": 3,
+                    "output_tokens": 1,
+                    "model_steps": 1,
+                },
+            )
+
     def test_source_deleted_after_collection_and_lost_ack_do_not_lose_or_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
