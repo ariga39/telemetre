@@ -204,8 +204,18 @@ class WindowObservation:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WindowObservation":
-        remaining = data.get("remaining") or {}
-        reset = data.get("reset") or {}
+        if not isinstance(data, Mapping):
+            raise ValueError("each observation window must be an object")
+        remaining = data.get("remaining")
+        if remaining is None:
+            remaining = {}
+        elif not isinstance(remaining, Mapping):
+            raise ValueError("window remaining must be an object")
+        reset = data.get("reset")
+        if reset is None:
+            reset = {}
+        elif not isinstance(reset, Mapping):
+            raise ValueError("window reset must be an object")
         return cls(
             group=str(data.get("group") or ""),
             bucket_id=str(data.get("bucket_id") or ""),
@@ -274,7 +284,10 @@ class Observation:
             raise ValueError("observation is missing required identity fields")
         if status not in ("success", "failure"):
             raise ValueError("observation status must be success or failure")
-        windows = tuple(WindowObservation.from_dict(item) for item in data.get("windows") or ())
+        raw_windows = data.get("windows", [])
+        if not isinstance(raw_windows, list):
+            raise ValueError("observation windows must be a list")
+        windows = tuple(WindowObservation.from_dict(item) for item in raw_windows)
         error = data.get("error") or {}
         interval = data.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
         try:
@@ -336,8 +349,8 @@ def load_config(path: str | os.PathLike | None) -> Config:
     tz_name = str(payload.get("timezone") or "UTC")
     _zone(tz_name)
     raw_sources = payload.get("providers")
-    if not isinstance(raw_sources, list) or not raw_sources:
-        raise QuotaError("config.providers must be a non-empty list")
+    if not isinstance(raw_sources, list):
+        raise QuotaError("config.providers must be a list")
     sources: list[SourceConfig] = []
     for raw in raw_sources:
         if not isinstance(raw, dict):
@@ -788,7 +801,7 @@ def _window_from_codex_slot(
             )
         minutes = int(duration)
         if minutes < 0:
-            anomalies.append("invalid_window")
+            raise CollectionError("invalid_window", "windowDurationMins is negative")
     resets_raw = raw_slot.get("resetsAt")
     reset_at = None
     if resets_raw is None or resets_raw == 0 or resets_raw == "0":
@@ -1441,6 +1454,7 @@ def current_report(
                 {
                     "provider": provider,
                     "account": account,
+                    "expected": (config is None) or ((provider, account) in configured),
                     "interval_seconds": interval,
                     "missing": missing,
                     "stale": stale,
@@ -1680,10 +1694,14 @@ def _cmd_report(args) -> int:
         unhealthy = [
             account
             for account in report["accounts"]
-            if account.get("missing") or account.get("stale")
-            or (
-                account.get("last_attempt") is not None
-                and account["last_attempt"]["status"] == "failure"
+            if account.get("expected", True)
+            and (
+                account.get("missing")
+                or account.get("stale")
+                or (
+                    account.get("last_attempt") is not None
+                    and account["last_attempt"]["status"] == "failure"
+                )
             )
         ]
         return 3 if unhealthy else 0
@@ -1966,11 +1984,15 @@ def date_report(
             ) and not windows
             stale = True
             if latest_success_before_end is not None:
+                # A dated report is evaluated at the end of its requested
+                # period, not at the wall clock when it is rendered.  A
+                # complete yesterday therefore stays fresh when its last
+                # sample is fresh at midnight, even if it is viewed today.
                 age = max(
                     0,
                     int(
                         (
-                            generated
+                            end
                             - _timestamp_from_any(latest_success_before_end["sampled_at"])
                         ).total_seconds()
                     ),
@@ -1980,6 +2002,7 @@ def date_report(
                 {
                     "provider": provider,
                     "account": account,
+                    "expected": (config is None) or ((provider, account) in configured),
                     "interval_seconds": interval,
                     "missing": bool(gaps),
                     "missing_gaps": gaps,

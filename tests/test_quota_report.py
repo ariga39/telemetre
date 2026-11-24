@@ -152,5 +152,88 @@ class CurrentReportSemanticsTest(unittest.TestCase):
         )
         self.assertEqual(stale.returncode, 3)
 
+    def test_check_ignores_db_only_history_after_a_source_is_removed_from_config(self):
+        write_fake_agy(self.tmp, payload=agy_payload(0.6))
+        both = write_config(
+            self.tmp,
+            [
+                source("agy", "personal", self.agy, interval_seconds=900),
+                source("agy", "retired", self.agy, interval_seconds=900),
+            ],
+            database=self.db,
+        )
+        first = run_cli(
+            "sample", "--config", both, "--now", "2026-01-01T00:00:00Z", "--json"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        current = write_config(
+            self.tmp,
+            [source("agy", "personal", self.agy, interval_seconds=900)],
+            database=self.db,
+        )
+        write_fake_agy(self.tmp, payload=agy_payload(0.4))
+        second = run_cli(
+            "sample", "--config", current, "--now", "2026-01-01T01:00:00Z", "--json"
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+        report_process = run_cli(
+            "report",
+            "--config",
+            current,
+            "--now",
+            "2026-01-01T01:01:00Z",
+            "--json",
+        )
+        self.assertEqual(report_process.returncode, 0, report_process.stderr)
+        accounts = {
+            account["account"]: account
+            for account in json_output(report_process)["accounts"]
+        }
+        self.assertTrue(accounts["personal"]["expected"])
+        self.assertFalse(accounts["retired"]["expected"])
+        self.assertEqual(len(accounts["retired"]["windows"]), 1)
+        self.assertEqual(
+            accounts["retired"]["windows"][0]["remaining"]["display_percent"], 60.0
+        )
+
+        checked = run_cli(
+            "report",
+            "--config",
+            current,
+            "--now",
+            "2026-01-01T01:01:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        empty = write_config(self.tmp, [], database=self.db)
+        removed = run_cli(
+            "report",
+            "--config",
+            empty,
+            "--now",
+            "2026-01-01T01:01:00Z",
+            "--json",
+        )
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        removed_accounts = {
+            account["account"]: account
+            for account in json_output(removed)["accounts"]
+        }
+        self.assertEqual(set(removed_accounts), {"personal", "retired"})
+        self.assertTrue(all(not account["expected"] for account in removed_accounts.values()))
+        removed_check = run_cli(
+            "report",
+            "--config",
+            empty,
+            "--now",
+            "2026-01-01T01:01:00Z",
+            "--check",
+        )
+        self.assertEqual(removed_check.returncode, 0, removed_check.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

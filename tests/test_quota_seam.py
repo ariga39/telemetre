@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,6 +121,24 @@ class ObservationSeamTest(unittest.TestCase):
         observation["windows"][0]["remaining"]["display_percent"] = float("nan")
         with self.assertRaises(ValueError):
             ingest_observation(self.tmp / "center.sqlite3", observation)
+
+
+    def test_rejects_non_list_window_shapes_as_value_errors(self):
+        self.sample("2026-01-01T00:00:00Z", 0.5)
+        valid = list(iter_observations(self.db))[0].to_dict()
+        invalid_windows = [
+            {},
+            "not-a-list",
+            [None],
+            ["not-an-object"],
+            [{"remaining": []}],
+            [{"reset": []}],
+        ]
+        for windows in invalid_windows:
+            payload = copy.deepcopy(valid)
+            payload["windows"] = windows
+            with self.assertRaises(ValueError):
+                Observation.from_dict(payload)
 
 
 if __name__ == "__main__":

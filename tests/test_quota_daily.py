@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -19,7 +20,12 @@ except ImportError:  # running from the repository root
         write_fake_agy,
     )
 
-from telemetre.quota import get_daily_summary
+from telemetre.quota import (
+    Observation,
+    WindowObservation,
+    get_daily_summary,
+    ingest_observation,
+)
 
 
 def payload(remaining: float, reset: str):
@@ -175,6 +181,89 @@ class DatedReportTest(unittest.TestCase):
         )
         self.assertEqual(viewed.returncode, 0, viewed.stderr)
         self.assertEqual(json_output(viewed)["date"], "2026-01-01")
+
+
+class PeriodEndStalenessTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "quota.sqlite3"
+        self.agy = write_fake_agy(self.tmp, payload=payload(0.5, R1))
+        self.config = write_config(
+            self.tmp,
+            [source("agy", "personal", self.agy, interval_seconds=900)],
+            database=self.db,
+            timezone="Asia/Shanghai",
+        )
+        start = datetime.fromisoformat("2025-12-31T16:00:00+00:00")
+        for index in range(96):
+            when = start + timedelta(minutes=15 * index)
+            sampled_at = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+            observation = Observation(
+                provider="agy",
+                account="personal",
+                machine="test-machine",
+                sampled_at=sampled_at,
+                status="success",
+                windows=(
+                    WindowObservation(
+                        group="Gemini",
+                        bucket_id="weekly",
+                        window="7d",
+                        window_minutes=10080,
+                        remaining_value=0.5,
+                        remaining_unit="fraction",
+                        remaining_display=50.0,
+                        reset_raw=R1,
+                        reset_at=R1,
+                    ),
+                ),
+                interval_seconds=900,
+                sample_id=f"period-{index}",
+            )
+            ingest_observation(self.db, observation, received_at=when)
+
+    def test_dated_report_and_daily_use_the_requested_period_end_for_staleness(self):
+        report = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--json",
+        )
+        self.assertEqual(report.returncode, 0, report.stderr)
+        account = json_output(report)["accounts"][0]
+        self.assertFalse(account["stale"])
+        self.assertFalse(account["missing"])
+
+        checked = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        daily = run_cli(
+            "daily",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--json",
+        )
+        self.assertEqual(daily.returncode, 0, daily.stderr)
+        self.assertFalse(json_output(daily)["accounts"][0]["stale"])
 
 
 if __name__ == "__main__":
