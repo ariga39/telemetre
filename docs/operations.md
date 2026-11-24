@@ -1,43 +1,43 @@
-# telemetre 运维手册
+# telemetre operations guide
 
-本手册覆盖切片三：受限 SSH 投递、定时与单实例作业、预期来源健康检查、中心 SQLite 在线备份与恢复。采集、月报和额度采样的字段口径见 `docs/DESIGN.md`、`docs/agy-usage.md` 和 `docs/quota.md`。
+This guide covers slice three: restricted SSH delivery, scheduled and single-instance jobs, expected-source health checks, and online backup/restore of the centre SQLite database. For the field rules used by collection, monthly reports, and quota sampling, see `docs/DESIGN.md`, `docs/agy-usage.md`, and `docs/quota.md`.
 
-所有命令只用 Python 标准库和系统 `ssh`。绑定文件、主机公钥文件和身份文件不含模型凭据；不要在本手册涉及的任何文件中写入 OAuth token、API key、私钥正文或 provider 原始输出。
+All commands use only the Python standard library and the system `ssh`. Binding files, host public-key files, and identity files contain no model credentials; do not write OAuth tokens, API keys, private-key material, or raw provider output into any file discussed here.
 
-## 1. 主机与目录
+## 1. Hosts and directories
 
-采集和额度采样必须在该机器实际登录 agy/Codex 的用户下运行，保留其可写 home、登录状态和 CLI 路径。不要用中心的受限服务用户运行源端作业。
+Collection and quota sampling must run as the user who is actually logged in to agy/Codex on that machine, preserving that user's writable home, login state, and CLI path. Do not run source-side jobs as the centre's restricted service user.
 
-源端用户（示例用户 `alpha`）：
-
-```text
-~/.gemini/antigravity-cli                          agy 1.5.16 数据根
-~/.local/state/telemetre/client.sqlite3            usage 待发队列
-~/.local/state/telemetre/quota.sqlite3             额度本地库
-~/.config/telemetre/telemetre.env                  机器/账号/绑定 ID/SSH 目标
-~/.config/telemetre/bindings.json                  客户端校验用的绑定副本
-~/.config/telemetre/quota.json                     本地 agy/Codex 采样配置
-~/.ssh/telemetre_usage                             绑定 alpha-usage 的专用密钥
-~/.ssh/telemetre_quota_agy                         绑定 alpha-quota-agy 的专用密钥
-~/.ssh/telemetre_quota_codex                       绑定 alpha-quota-codex 的专用密钥
-~/.ssh/telemetre_known_hosts                       固定中心主机公钥
-```
-
-中心（只运行受限服务用户 `telemetre`）：
+Source-side user (example user `alpha`):
 
 ```text
-/etc/telemetre/bindings.json         权威绑定表（root:telemetre 0640）
-/etc/telemetre/center.env            中心数据库/备份/健康检查路径
-/etc/telemetre/quota-center.json     中心日摘要时区和两个 provider
-/var/lib/telemetre/center.sqlite3    中心唯一 SQLite 数据库
-/var/backups/telemetre/              在线备份快照
+~/.gemini/antigravity-cli                          agy 1.5.16 data root
+~/.local/state/telemetre/client.sqlite3            usage pending queue
+~/.local/state/telemetre/quota.sqlite3             local quota database
+~/.config/telemetre/telemetre.env                  machine/account/binding ID/SSH target
+~/.config/telemetre/bindings.json                  binding copy used for client-side validation
+~/.config/telemetre/quota.json                     local agy/Codex sampling configuration
+~/.ssh/telemetre_usage                             dedicated key bound to alpha-usage
+~/.ssh/telemetre_quota_agy                         dedicated key bound to alpha-quota-agy
+~/.ssh/telemetre_quota_codex                       dedicated key bound to alpha-quota-codex
+~/.ssh/telemetre_known_hosts                       pinned centre host public key
 ```
 
-每个客户端机器有自己的稳定 `machine` 别名和账号别名。每把 SSH 公钥在中心只绑定一个身份；usage、agy 额度和 Codex 额度使用不同密钥和不同绑定 ID。额度写入权只发给指定采样机。
+Centre (runs only the restricted service user `telemetre`):
 
-## 2. 中心绑定与强制命令
+```text
+/etc/telemetre/bindings.json         authoritative binding table (root:telemetre 0640)
+/etc/telemetre/center.env            centre database/backup/health-check paths
+/etc/telemetre/quota-center.json     centre daily-summary timezone and both providers
+/var/lib/telemetre/center.sqlite3    the centre's single SQLite database
+/var/backups/telemetre/              online backup snapshots
+```
 
-`bindings.json` 示例见 `examples/bindings.example.json`。键是绑定 ID，值只包含：
+Each client machine has its own stable `machine` alias and account alias. Each SSH public key binds to exactly one identity at the centre; usage, agy quota, and Codex quota use different keys and different binding IDs. Quota write permission is granted only to the designated sampling machine.
+
+## 2. Centre bindings and forced commands
+
+See `examples/bindings.example.json` for a `bindings.json` example. Keys are binding IDs and values contain only:
 
 ```json
 {
@@ -63,9 +63,9 @@
 }
 ```
 
-服务端从被认证的绑定取 `machine/account/kind/provider`；请求体里的同名字段一律不使用。`quota_sample` 必须写 `provider`，`agy_usage` 不得写。源端 `~/.config/telemetre/bindings.json` 只需放本机用到的条目，并保持与中心副本一致；真正的授权以中心文件为准。
+The server takes `machine/account/kind/provider` from the authenticated binding; fields with the same names in the request body are never used. `quota_sample` must set `provider`; `agy_usage` must not. The source-side `~/.config/telemetre/bindings.json` only needs the entries used by that machine and must stay consistent with the centre copy; the centre file is authoritative for authorization.
 
-中心为专用用户 `telemetre` 的 `authorized_keys` 安装每把公钥自己的强制命令。示例：
+The centre installs each public key's own forced command in the `authorized_keys` file of the restricted user `telemetre`. Example:
 
 ```text
 restrict,command="/usr/bin/python3 -m telemetre.delivery receive --bindings /etc/telemetre/bindings.json --binding-id alpha-usage --center-db /var/lib/telemetre/center.sqlite3 --max-rows 1000 --max-bytes 262144" ssh-ed25519 AAAA... alpha-usage
@@ -73,9 +73,9 @@ restrict,command="/usr/bin/python3 -m telemetre.delivery receive --bindings /etc
 restrict,command="/usr/bin/python3 -m telemetre.delivery receive --bindings /etc/telemetre/bindings.json --binding-id alpha-quota-codex --center-db /var/lib/telemetre/center.sqlite3 --max-bytes 262144" ssh-ed25519 AAAA... alpha-quota-codex
 ```
 
-`restrict` 禁用 PTY、端口转发、agent 转发、X11 和用户 rc；无需再单独放行任何转发。客户端发来的远程命令不会被执行，实际执行的是该公钥的 `command=`。
+`restrict` disables PTY, port forwarding, agent forwarding, X11, and user rc; no forwarding needs to be enabled separately. The remote command sent by the client is not executed; the key's `command=` is.
 
-`/etc/ssh/sshd_config` 至少收紧到：
+At minimum, tighten `/etc/ssh/sshd_config` to:
 
 ```text
 PasswordAuthentication no
@@ -93,7 +93,7 @@ AuthenticationMethods publickey
 MaxAuthTries 2
 ```
 
-`telemetre` 用户需要能执行强制命令，因此 shell 使用 `/bin/sh`，但只接受上面这些受限公钥。数据库目录归 `telemetre` 所有：
+The `telemetre` user must be able to execute the forced command, so its shell is `/bin/sh`, but it accepts only the restricted public keys above. Database directories are owned by `telemetre`:
 
 ```bash
 install -d -o telemetre -g telemetre -m 0750 /var/lib/telemetre /var/backups/telemetre
@@ -102,9 +102,9 @@ chown telemetre:telemetre /var/lib/telemetre/center.sqlite3 2>/dev/null || true
 chmod 0640 /etc/telemetre/bindings.json /etc/telemetre/center.env
 ```
 
-## 3. 客户端配置
+## 3. Client configuration
 
-在该机器实际使用 agy/Codex 的普通用户下生成三把专用密钥，一把密钥只对应一个绑定和一个 provider：
+Generate three dedicated keys under the ordinary user that actually uses agy/Codex on that machine; one key maps to one binding and one provider:
 
 ```bash
 ssh-keygen -t ed25519 -N '' -f ~/.ssh/telemetre_usage
@@ -112,19 +112,19 @@ ssh-keygen -t ed25519 -N '' -f ~/.ssh/telemetre_quota_agy
 ssh-keygen -t ed25519 -N '' -f ~/.ssh/telemetre_quota_codex
 ```
 
-把公钥交给中心管理员，分别写入 `alpha-usage`、`alpha-quota-agy`、`alpha-quota-codex` 的 `authorized_keys` 行。私钥权限必须是 `0600`；`send`/`send-quota` 会拒绝组或其他用户可读写的身份文件。
+Give the public keys to the centre administrator and write them into the `authorized_keys` lines for `alpha-usage`, `alpha-quota-agy`, and `alpha-quota-codex`. Private keys must be mode `0600`; `send`/`send-quota` reject identity files readable or writable by group or others.
 
-agy 1.5.16 的数据根是 `~/.gemini/antigravity-cli`，`agy -p /usage` 还会写入该用户的登录/日志目录，因此源端作业必须以该用户运行并可写自己的 home。Codex 的 `app-server` 也使用该用户的登录状态。systemd 示例因此是 **user unit**，不要套用中心的 `ProtectHome=read-only` 或 `telemetre` 服务用户。若 CLI 不在默认 PATH，编辑 user unit 的 `Environment=PATH=...`，例如把 nvm 的 node bin 或 `~/.local/bin` 放在前面。
+The agy 1.5.16 data root is `~/.gemini/antigravity-cli`, and `agy -p /usage` also writes to that user's login/log directory, so source-side jobs must run as that user and be able to write its own home. Codex's `app-server` also uses that user's login state. The systemd examples are therefore **user units**; do not apply the centre's `ProtectHome=read-only` or the `telemetre` service user to them. If a CLI is not on the default PATH, edit the user unit's `Environment=PATH=...`, for example by putting an nvm node bin directory or `~/.local/bin` first.
 
-固定中心主机公钥，必须先通过带外渠道核对指纹，再把公钥行写入 `known_hosts`。非 22 端口时主机名写成 `[centre.example.test]:2222`：
+Pin the centre host public key: verify the fingerprint out of band first, then write the key line into `known_hosts`. For a non-22 port, write the host as `[centre.example.test]:2222`:
 
 ```text
 centre.example.test ssh-ed25519 AAAAC3Nza...
 ```
 
-客户端传 `--known-hosts`，不要依赖 `~/.ssh/config`：投递命令固定使用 `-F /dev/null`、`StrictHostKeyChecking=yes`、`UserKnownHostsFile=<指定文件>`、`GlobalKnownHostsFile=/dev/null`、`BatchMode=yes`、`IdentitiesOnly=yes`，并关闭所有转发。身份文件不要设口令；定时作业没有交互输入。
+Clients pass `--known-hosts` and do not rely on `~/.ssh/config`: delivery commands always use `-F /dev/null`, `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<specified file>`, `GlobalKnownHostsFile=/dev/null`, `BatchMode=yes`, and `IdentitiesOnly=yes`, and disable all forwarding. Do not set a passphrase on identity files; scheduled jobs have no interactive input.
 
-源端路径模板是 `examples/telemetre.user.env.example`（复制到 `~/.config/telemetre/telemetre.env`）；中心路径模板是 `examples/telemetre.center.env.example`（复制到 `/etc/telemetre/center.env`）。手工采集与投递：
+The source path template is `examples/telemetre.user.env.example` (copy to `~/.config/telemetre/telemetre.env`); the centre path template is `examples/telemetre.center.env.example` (copy to `/etc/telemetre/center.env`). Manual collection and delivery:
 
 ```bash
 export PYTHONPATH=/opt/telemetre
@@ -143,7 +143,7 @@ python3 -m telemetre.delivery send \
   --known-hosts ~/.ssh/telemetre_known_hosts
 ```
 
-额度采样与投递，agy 和 Codex 各用自己的密钥和绑定：
+Quota sampling and delivery, with agy and Codex each using their own key and binding:
 
 ```bash
 python3 -m telemetre.quota sample --config ~/.config/telemetre/quota.json --if-due
@@ -165,26 +165,26 @@ python3 -m telemetre.delivery send-quota \
   --known-hosts ~/.ssh/telemetre_known_hosts
 ```
 
-一次额度请求只带一个样本，中心对单样本事务提交后才回 ACK。超时或 ACK 丢失时同一 `sample_id` 重传，中心按样本 ID 幂等。同一本地额度库里可以同时存在多台机器、多个 provider 或多个账号的样本；每次 `send-quota` 只同步并尝试当前绑定对应的 machine/provider/account，其他样本保持待发。
+One quota request carries exactly one sample, and the centre ACKs only after the single-sample transaction commits. On timeout or a lost ACK, retransmit the same `sample_id`; the centre is idempotent by sample ID. One local quota database may contain samples for multiple machines, providers, or accounts at the same time; each `send-quota` synchronizes and attempts only samples for the current binding's machine/provider/account, leaving other samples pending.
 
-`--max-bytes` 必须不大于服务端强制命令里的值。默认 262144 字节；`send` 默认每次最多 1000 条 agy 事实，超限会自动缩小批次，单条放不下时保留队列并报错。
+`--max-bytes` must not exceed the value in the server forced command. The default is 262144 bytes; `send` defaults to at most 1000 agy facts per run, shrinks the batch automatically when over the limit, and retains the queue with an error when a single fact does not fit.
 
-## 4. 定时、单实例与硬超时
+## 4. Scheduling, single instances, and hard timeouts
 
-`examples/systemd/` 区分源端 user unit 和中心 system unit：
+`examples/systemd/` distinguishes source-side user units from centre system units:
 
-源端（以实际登录 agy/Codex 的用户运行）：
+Source side (run as the user actually logged in to agy/Codex):
 
-- `telemetre-collect.service/.timer`：每小时采集 `~/.gemini/antigravity-cli` 并投递 usage 队列。
-- `telemetre-quota.service/.timer`：每 15 分钟按各来源间隔采样；agy 和 Codex 各自使用自己的密钥/绑定投递。
+- `telemetre-collect.service/.timer`: collect `~/.gemini/antigravity-cli` hourly and deliver the usage queue.
+- `telemetre-quota.service/.timer`: sample at each source's interval every 15 minutes; agy and Codex each deliver with their own key/binding.
 
-中心（只运行受限用户 `telemetre`）：
+Centre (runs only the restricted user `telemetre`):
 
-- `telemetre-backup.service/.timer`：每天在线备份。
-- `telemetre-health.service/.timer`：每 30 分钟检查预期来源。
-- `telemetre-quota-daily.service/.timer`：每天 00:17 生成“昨天”的额度摘要，时区和两个 provider 由 `quota-center.json` 决定。
+- `telemetre-backup.service/.timer`: online backup once a day.
+- `telemetre-health.service/.timer`: check expected sources every 30 minutes.
+- `telemetre-quota-daily.service/.timer`: generate "yesterday's" quota summary daily at 00:17; the timezone and both providers come from `quota-center.json`.
 
-源端安装：
+Source-side installation:
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.config/telemetre
@@ -199,9 +199,9 @@ systemctl --user enable --now telemetre-collect.timer telemetre-quota.timer
 loginctl enable-linger "$USER"
 ```
 
-`telemetre-quota.service` 先跑 `quota sample --if-due`，再分别对 `alpha-quota-agy` 和 `alpha-quota-codex` 调用 `send-quota`；每条 `send-quota` 都带 `-` 前缀，因此一个 provider 采样失败或投递失败不会阻止另一个。同一额度库里混有多台机器/多个 provider/多个账号时，`send-quota` 只同步并尝试当前绑定元组（machine/provider/account）的样本，其他样本保持待发。
+`telemetre-quota.service` first runs `quota sample --if-due`, then calls `send-quota` separately for `alpha-quota-agy` and `alpha-quota-codex`; each `send-quota` line has a `-` prefix, so a sampling or delivery failure for one provider does not block the other. When one quota database contains multiple machines/providers/accounts, `send-quota` synchronizes and attempts only samples for the current binding tuple (machine/provider/account); other samples remain pending.
 
-中心安装：
+Centre installation:
 
 ```bash
 sudo cp examples/systemd/telemetre-backup.service examples/systemd/telemetre-backup.timer \
@@ -216,7 +216,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now telemetre-backup.timer telemetre-health.timer telemetre-quota-daily.timer
 ```
 
-`quota-center.json` 列出 agy 和 Codex 两个 account；`telemetre-quota-daily` 不带 `--date`，因此 `quota daily` 在配置时区里选择昨天，并把摘要写入中心库的 `quota_daily`。需要补生成或查看某一天时显式给日期：
+`quota-center.json` lists both the agy and Codex accounts; `telemetre-quota-daily` does not pass `--date`, so `quota daily` selects yesterday in the configured timezone and writes the summary to `quota_daily` in the centre database. To regenerate or view a particular day, pass the date explicitly:
 
 ```bash
 python3 -m telemetre.quota daily \
@@ -225,19 +225,19 @@ python3 -m telemetre.quota daily \
   --date 2026-11-05 --json
 ```
 
-每个耗时作业都包一层：
+Wrap each long-running job in:
 
 ```text
-python3 -m telemetre.delivery run --lock <lock> --timeout <秒> -- <实际命令...>
+python3 -m telemetre.delivery run --lock <lock> --timeout <seconds> -- <actual command...>
 ```
 
-`run` 做两件事：`flock` 保证同一锁只有一个实例；到时向整个进程组发 TERM/KILL，返回 124。已有一个实例时后启动者输出 `skipped: already running` 并以 0 退出，不排队、不重复采集。systemd 的 `TimeoutStartSec` 是外层保险，内层 `--timeout` 应更短。
+`run` does two things: `flock` guarantees only one instance per lock; at the deadline it sends TERM/KILL to the whole process group and returns 124. When an instance already exists, a later start prints `skipped: already running` and exits 0 without queuing or collecting twice. systemd's `TimeoutStartSec` is the outer safety net; the inner `--timeout` should be shorter.
 
-cron 等价示例见 `examples/cron/telemetre.crontab`。cron 没有 systemd 的 `TimeoutStartSec`，因此必须使用 `delivery run --timeout`。
+See `examples/cron/telemetre.crontab` for the cron equivalent. cron has no systemd `TimeoutStartSec`, so it must use `delivery run --timeout`.
 
-## 5. 健康检查与监控
+## 5. Health checks and monitoring
 
-中心检查预期来源，而不是只列出“已上报”的来源：
+The centre checks expected sources instead of listing only sources that have reported:
 
 ```bash
 python3 -m telemetre.delivery check \
@@ -249,17 +249,17 @@ python3 -m telemetre.delivery check \
   --format json
 ```
 
-退出码：
+Exit codes:
 
-- `0`：所有预期来源健康。
-- `3`：有来源从未上报、扫描报告源缺失、最近一次额度尝试失败，或样本超过新鲜度阈值。
-- `2`：参数、数据库或绑定配置错误。
+- `0`: all expected sources are healthy.
+- `3`: a source has never reported, a scan reports the source missing, the latest quota attempt failed, or a sample exceeds the freshness threshold.
+- `2`: argument, database, or binding configuration error.
 
-`--expect-usage` 和 `--expect-quota` 可重复。没有列出预期来源时，只检查中心已存在的 usage 来源；生产监控应显式列出每台机器/账号，否则“从未上报”不会被发现。JSON 中每项带 `kind`、`machine`、`account`/`provider`、`reason`、`last_success` 等字段。
+`--expect-usage` and `--expect-quota` may be repeated. When no expected sources are listed, only usage sources already present at the centre are checked; production monitoring should list every machine/account explicitly, otherwise "never reported" will not be detected. Each JSON item includes fields such as `kind`, `machine`, `account`/`provider`, `reason`, and `last_success`.
 
-## 6. 在线备份
+## 6. Online backup
 
-中心每次备份都用 SQLite 在线备份接口，不改动运行中的数据库：
+Each centre backup uses the SQLite online backup interface and does not disturb the running database:
 
 ```bash
 python3 -m telemetre.delivery backup \
@@ -267,73 +267,73 @@ python3 -m telemetre.delivery backup \
   --dest /var/backups/telemetre
 ```
 
-命令先写临时文件，执行 `PRAGMA integrity_check` 和 `PRAGMA foreign_key_check`，再原子改名为独立快照；失败不会留下半成品。输出包含 `path`、`tables`、`row_counts` 和 `integrity`。可随时独立复核：
+The command first writes a temporary file, runs `PRAGMA integrity_check` and `PRAGMA foreign_key_check`, then atomically renames it to an independent snapshot; failure leaves no partial file. Output includes `path`, `tables`, `row_counts`, and `integrity`. Verify independently at any time:
 
 ```bash
 python3 -m telemetre.delivery verify-backup --backup /var/backups/telemetre/telemetre-center-....sqlite3
 ```
 
-快照包含 usage 和 quota 两类表（若中心已写入）。备份目录的保留策略由外部负责，例如用文件系统快照或定期归档；本项目不自动删除旧快照。
+Snapshots contain both usage and quota tables (if the centre has written them). Retention of the backup directory is handled externally, for example with filesystem snapshots or periodic archives; this project does not delete old snapshots automatically.
 
-## 7. 恢复
+## 7. Restore
 
-恢复只允许写入一个**不存在的新路径**，不会替换运行中的数据库，也不会移动其 `-wal`/`-shm`。先用原子 no-clobber 链接安装，两个并发恢复只有一个能成功；已存在的目标文件保持不变。
+Restore only writes to a **new path that does not exist**; it never replaces the running database or moves its `-wal`/`-shm`. It installs with an atomic no-clobber link; of two concurrent restores, only one can succeed, and an existing target file stays unchanged.
 
 ```bash
-# 1. 停掉所有会写中心的定时器/服务
+# 1. Stop all timers/services that write to the centre
 sudo systemctl stop telemetre-collect.timer telemetre-quota.timer \
   telemetre-backup.timer telemetre-health.timer
 sudo systemctl stop telemetre-collect.service telemetre-quota.service
 
-# 2. 恢复到一个全新路径（不能已存在）
+# 2. Restore to a brand-new path (it must not already exist)
 python3 -m telemetre.delivery restore \
   --backup /var/backups/telemetre/telemetre-center-....sqlite3 \
   --center-db /var/lib/telemetre/center-restored.sqlite3
 
-# 3. 用恢复库出月报和额度历史，核对后再切换
+# 3. Produce the monthly report and quota history from the restored database, verify them, then switch
 python3 -m telemetre report --center-db /var/lib/telemetre/center-restored.sqlite3 \
   --month 2026-11 --format json
 python3 -m telemetre.quota report --db /var/lib/telemetre/center-restored.sqlite3 --json
 ```
 
-核对通过后，把 `/etc/telemetre/center.env` 中的 `CENTER_DB` 改为新路径（服务端强制命令里的 `--center-db` 也要同步改），重载并启动定时器。旧库原样保留，供事后检查或手工归档；需要清理时由操作者显式处理。恢复目标已存在时命令直接报错，不会覆盖。
+After verification, change `CENTER_DB` in `/etc/telemetre/center.env` to the new path (also update `--center-db` in the server forced commands), reload, and start the timers. Keep the old database as-is for post-incident inspection or manual archiving; cleanup is an explicit operator action. If the restore target already exists, the command fails without overwriting.
 
-恢复只回到最近一次成功快照。快照之后的中心写入会丢失；客户端的待发队列和 agy 源日志仍在，可重新采集并重放，重放按事实键和样本 ID 幂等。
+Restore only returns to the latest successful snapshot. Centre writes after that snapshot are lost; the client pending queues and agy source logs remain, so collection and replay can catch up, and replay is idempotent by fact key and sample ID.
 
-## 8. 重试、确认与恢复语义
+## 8. Retry, acknowledgement, and recovery semantics
 
-- 客户端收到合法 ACK 才删除 `pending`（usage）或标记 outbox 已送达（quota）。超时、主机公钥失败、非零退出、非 JSON ACK、身份不匹配、输出超限都会保留待发项。
-- 中心 usage 接收在事务提交后才输出 ACK；额度接收对单个样本调用 `ingest_observation`，单样本事务提交后才回 ACK。ACK 丢失后重传得到的 `duplicates` 只表示重复，不会增加计数。
-- 请求体有行数和字节上限；服务端先读 `max_bytes + 1`，超限整批拒绝。usage 的坏行/坏批次不会写入部分事件。
-- 主机密钥校验失败时不要关闭 `StrictHostKeyChecking`；通过带外核对新指纹后更新固定 `known_hosts`。
-- 客户端离线时继续采集到本地 SQLite；中心恢复后按顺序重放。源日志被清理后，未暂存的事实无法补回。
+- Clients delete `pending` (usage) or mark the outbox delivered (quota) only after receiving a valid ACK. Timeout, host-key failure, non-zero exit, non-JSON ACK, identity mismatch, and oversized output all retain the pending item.
+- Centre usage receive emits its ACK only after the transaction commits; quota receive calls `ingest_observation` for one sample and ACKs only after the single-sample transaction commits. `duplicates` after a lost ACK means only a duplicate; it does not increase counts.
+- Request bodies have row and byte limits; the server reads `max_bytes + 1` first and rejects the entire batch when over the limit. A bad usage line/batch does not write partial events.
+- When host-key verification fails, do not disable `StrictHostKeyChecking`; verify the new fingerprint out of band and update the pinned `known_hosts`.
+- While offline, the client keeps collecting into local SQLite; after centre recovery it replays in order. Once source logs are cleaned up, facts that were never staged cannot be recovered.
 
-## 9. 安全边界
+## 9. Security boundary
 
-- 身份只来自 SSH 公钥对应的绑定；修改请求 JSON 不能冒充其他机器、账号、provider 或数据类型。
-- 正文、提示、工具参数、环境变量、OAuth/API 凭据不进入协议。receiver 对 quota 样本重新验证：拒绝不一致的展示百分比、嵌套/异常形状的 `reset.raw`、未知 anomaly 类别和不支持的字段；错误详情归并为固定安全类别，原样 provider 文本不落库。
-- 额度请求只接受一个观察；失败观察不带窗口。坏批次在任何写入前拒绝。
-- 客户端固定主机公钥、禁用交互认证和转发；服务端每把公钥独立强制命令、`restrict`、专用用户和受限 sshd。
-- 轮换密钥：新公钥先加绑定和 `authorized_keys`，验证后删除旧行；删除密钥即撤销该绑定的写入权。绑定表不含秘密，但仍应限制写权限。
+- Identity comes only from the binding associated with the SSH public key; editing the request JSON cannot impersonate another machine, account, provider, or data kind.
+- Message bodies, prompts, tool arguments, environment variables, and OAuth/API credentials never enter the protocol. The receiver re-validates quota samples: it rejects inconsistent display percentages, nested/anomalous `reset.raw` shapes, unknown anomaly categories, and unsupported fields; error details are reduced to fixed safe categories, and raw provider text is not stored.
+- A quota request accepts exactly one observation; failure observations carry no windows. A bad batch is rejected before any write.
+- Clients pin host public keys and disable interactive authentication and forwarding; the server uses a per-key forced command, `restrict`, a dedicated user, and a hardened sshd.
+- Key rotation: add the new public key to the binding and `authorized_keys`, verify, then remove the old line; removing a key revokes write permission for that binding. Binding files contain no secrets, but still restrict write access.
 
-## 10. 故障排查
+## 10. Troubleshooting
 
-| 现象 | 检查 |
+| Symptom | Check |
 | --- | --- |
-| `Host key verification failed` | 带外核对中心指纹，更新 `--known-hosts`；不要关闭严格校验。 |
-| `acknowledgement ... does not match` | 该公钥的强制命令是否用了正确 `--binding-id`；绑定表是否对应同一 machine/account/provider。 |
-| `ssh delivery timed out` | 中心接收或网络过慢；待发队列仍在。检查服务端锁等待和备份/维护窗口，再重试。 |
-| `batch is ... limit` / `request body exceeds` | 客户端和服务端的 `--max-bytes` 不一致，或单条事实过大；调低 `--max-rows`，保持两端上限一致。 |
-| `target database already exists` | 恢复必须选新路径；不要删除运行库来“腾位置”，先停服务并保留旧库。 |
-| `check` 退出 3 | 看 JSON 的 `reason`：`no successful scan reported`、`expected source missing`、`latest attempt failed` 或 `stale sample`。 |
-| `run ... skipped: already running` | 上一次定时作业未结束；这是单实例保护。检查锁文件和对应服务状态。 |
+| `Host key verification failed` | Verify the centre fingerprint out of band and update `--known-hosts`; do not disable strict verification. |
+| `acknowledgement ... does not match` | Does the key's forced command use the correct `--binding-id`? Does the binding table match the same machine/account/provider? |
+| `ssh delivery timed out` | Centre receive or the network is too slow; the pending queue remains. Check server lock waits and backup/maintenance windows, then retry. |
+| `batch is ... limit` / `request body exceeds` | Client and server `--max-bytes` differ, or one fact is too large; lower `--max-rows` and keep both limits consistent. |
+| `target database already exists` | Restore must choose a new path; do not delete the live database "to make room"; stop services and keep the old database. |
+| `check` exits 3 | Inspect the JSON `reason`: `no successful scan reported`, `expected source missing`, `latest attempt failed`, or `stale sample`. |
+| `run ... skipped: already running` | The previous scheduled job has not finished; this is single-instance protection. Check the lock file and the corresponding service state. |
 
-## 11. 验收
+## 11. Acceptance
 
-本切片的行为测试全部使用合成数据和本地假 SSH 可执行文件，不读取真实凭据、不访问真实主机。端到端测试覆盖两台客户端、受限投递、ACK 丢失/超时/主机密钥失败后的重试、并发提交、备份恢复和预期来源健康检查：
+This slice's behavioral tests use only synthetic data and local fake SSH executables; they do not read real credentials or contact real hosts. End-to-end tests cover two clients, restricted delivery, retry after lost ACK/timeout/host-key failure, concurrent submissions, backup/restore, and expected-source health checks:
 
 ```bash
 PYTHONPATH=/opt/telemetre python3 -m unittest discover -s tests -v
 ```
 
-真实主机验收时使用隔离的机器/账号别名和专用密钥，按第 2、3 节配置，先运行 `delivery check` 确认来源，再跑一次 `collect` → `send` → `report`。不要用真实账号做自动化写入测试。
+For real-host acceptance, use isolated machine/account aliases and dedicated keys, configure per sections 2 and 3, run `delivery check` first to confirm sources, then run `collect` → `send` → `report` once. Do not use real accounts for automated write tests.
