@@ -224,6 +224,40 @@ class PeriodEndStalenessTest(unittest.TestCase):
             )
             ingest_observation(self.db, observation, received_at=when)
 
+    def test_history_uses_the_recorded_interval_not_a_changed_current_config(self):
+        write_config(
+            self.tmp,
+            [source("agy", "personal", self.agy, interval_seconds=60)],
+            database=self.db,
+            timezone="Asia/Shanghai",
+        )
+        report = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--json",
+        )
+        self.assertEqual(report.returncode, 0, report.stderr)
+        account = json_output(report)["accounts"][0]
+        self.assertEqual(account["interval_seconds"], 900)
+        self.assertFalse(account["missing"])
+        self.assertFalse(account["stale"])
+        checked = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
     def test_dated_report_and_daily_use_the_requested_period_end_for_staleness(self):
         report = run_cli(
             "report",

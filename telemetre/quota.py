@@ -190,6 +190,24 @@ def _coerce_finite_float(value: Any, *, name: str) -> float | None:
     return parsed
 
 
+def _optional_string(value: Any, *, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def _string_sequence(value: Any, *, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a list of strings")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must contain only strings")
+    return tuple(value)
+
+
 def _json_load(text: str | None, default=None):
     if text is None:
         return default
@@ -273,20 +291,22 @@ class WindowObservation:
         return cls(
             group=str(data.get("group") or ""),
             bucket_id=str(data.get("bucket_id") or ""),
-            limit_id=data.get("limit_id"),
-            slot=data.get("slot"),
+            limit_id=_optional_string(data.get("limit_id"), name="limit_id"),
+            slot=_optional_string(data.get("slot"), name="slot"),
             window=data.get("window"),
             window_minutes=window_minutes,
             remaining_value=_coerce_finite_float(
                 remaining.get("source_value"), name="remaining.source_value"
             ),
-            remaining_unit=remaining.get("source_unit"),
+            remaining_unit=_optional_string(
+                remaining.get("source_unit"), name="remaining.source_unit"
+            ),
             remaining_display=_coerce_finite_float(
                 remaining.get("display_percent"), name="remaining.display_percent"
             ),
             reset_raw=reset.get("raw"),
             reset_at=reset.get("at"),
-            anomalies=tuple(data.get("anomalies") or ()),
+            anomalies=_string_sequence(data.get("anomalies"), name="anomalies"),
         )
 
 
@@ -346,7 +366,13 @@ class Observation:
         if not isinstance(raw_windows, list):
             raise ValueError("observation windows must be a list")
         windows = tuple(WindowObservation.from_dict(item) for item in raw_windows)
-        error = data.get("error") or {}
+        raw_error = data.get("error")
+        if raw_error is None:
+            error = {}
+        elif not isinstance(raw_error, Mapping):
+            raise ValueError("observation error must be an object")
+        else:
+            error = raw_error
         interval = _coerce_persisted_int(
             data.get("interval_seconds", DEFAULT_INTERVAL_SECONDS),
             name="interval_seconds",
@@ -359,8 +385,8 @@ class Observation:
             sampled_at=sampled_at,
             status=status,
             windows=windows,
-            error_kind=(error.get("kind") if isinstance(error, Mapping) else None),
-            error_detail=(error.get("detail") if isinstance(error, Mapping) else None),
+            error_kind=_optional_string(error.get("kind"), name="error.kind"),
+            error_detail=_optional_string(error.get("detail"), name="error.detail"),
             empty_windows=bool(data.get("empty_windows")),
             interval_seconds=interval,
             sample_id=sample_id,
@@ -1077,6 +1103,8 @@ def _validate_observation(observation: Observation) -> None:
         raise ValueError("failure observations must not carry windows")
     if not observation.sample_id:
         raise ValueError("sample_id must not be empty")
+    _optional_string(observation.error_kind, name="error.kind")
+    _optional_string(observation.error_detail, name="error.detail")
     _coerce_persisted_int(
         observation.interval_seconds, name="interval_seconds", minimum=1
     )
@@ -1084,6 +1112,13 @@ def _validate_observation(observation: Observation) -> None:
     for window in observation.windows:
         if not window.group or not window.bucket_id:
             raise ValueError("quota window has an empty group or bucket id")
+        _optional_string(window.limit_id, name="limit_id")
+        _optional_string(window.slot, name="slot")
+        _optional_string(window.remaining_unit, name="remaining_unit")
+        if not isinstance(window.anomalies, (tuple, list)) or any(
+            not isinstance(item, str) for item in window.anomalies
+        ):
+            raise ValueError("anomalies must be a sequence of strings")
         _coerce_finite_float(window.remaining_value, name="remaining_value")
         _coerce_finite_float(window.remaining_display, name="remaining_display")
         if window.window_minutes is not None:
@@ -1213,6 +1248,12 @@ def ingest_observation(
 
     if not isinstance(observation, Observation):
         observation = Observation.from_dict(observation)
+    else:
+        _validate_observation(observation)
+        # Canonicalize direct model values (integral floats, integer-valued
+        # remaining numbers, ...) before hashing so replaying the exported
+        # observation is idempotent.
+        observation = Observation.from_dict(observation.to_dict())
     _validate_observation(observation)
     interval_seconds = _coerce_persisted_int(
         observation.interval_seconds, name="interval_seconds", minimum=1
@@ -1999,7 +2040,15 @@ def date_report(
         start_epoch = start.timestamp()
         end_epoch = end.timestamp()
         for provider, account in accounts:
-            interval = configured.get((provider, account))
+            latest_sample_before_end = connection.execute(
+                """
+                SELECT * FROM quota_samples
+                WHERE provider = ? AND account = ? AND sampled_epoch < ?
+                ORDER BY sampled_epoch DESC, received_epoch DESC, sample_id DESC
+                LIMIT 1
+                """,
+                (provider, account, end_epoch),
+            ).fetchone()
             latest_success_before_end = connection.execute(
                 """
                 SELECT * FROM quota_samples
@@ -2010,9 +2059,12 @@ def date_report(
                 """,
                 (provider, account, end_epoch),
             ).fetchone()
-            if interval is None and latest_success_before_end is not None:
-                interval = int(latest_success_before_end["interval_seconds"])
-            interval = interval or DEFAULT_INTERVAL_SECONDS
+            if latest_sample_before_end is not None:
+                # History must keep the interval recorded with the samples.
+                # The current config may describe a different sampling policy.
+                interval = int(latest_sample_before_end["interval_seconds"])
+            else:
+                interval = configured.get((provider, account)) or DEFAULT_INTERVAL_SECONDS
             rows = connection.execute(
                 """
                 SELECT * FROM quota_samples
@@ -2031,6 +2083,7 @@ def date_report(
                 end,
                 interval,
             )
+            no_coverage_period = end <= start
             last_attempt = None
             if last_attempt_row is not None:
                 last_attempt = {
@@ -2111,7 +2164,7 @@ def date_report(
                     "account": account,
                     "expected": (config is None) or ((provider, account) in configured),
                     "interval_seconds": interval,
-                    "missing": bool(gaps),
+                    "missing": bool(gaps) or no_coverage_period,
                     "missing_gaps": gaps,
                     "stale": stale,
                     "attempts": len(rows),

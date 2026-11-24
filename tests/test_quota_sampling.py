@@ -509,9 +509,6 @@ class CodexInvalidDurationTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CodexSamplingTest(unittest.TestCase):
     def setUp(self):
@@ -961,3 +958,7 @@ class WindowAndFailureSemanticsTest(unittest.TestCase):
         self.assertEqual(
             accounts["codex"]["windows"][0]["remaining"]["display_percent"], 90.0
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

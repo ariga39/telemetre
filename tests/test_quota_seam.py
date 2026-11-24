@@ -24,6 +24,7 @@ from telemetre.quota import (
     OBSERVATION_SCHEMA,
     Observation,
     ObservationConflict,
+    WindowObservation,
     ingest_observation,
     iter_observations,
     read_observation,
@@ -122,6 +123,90 @@ class ObservationSeamTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ingest_observation(self.tmp / "center.sqlite3", observation)
 
+
+    def test_optional_fields_error_and_anomalies_reject_wrong_types(self):
+        self.sample("2026-01-01T00:00:00Z", 0.5)
+        valid = list(iter_observations(self.db))[0].to_dict()
+        center = self.tmp / "types.sqlite3"
+
+        cases = [
+            ("window", "limit_id", []),
+            ("window", "slot", 1),
+            ("remaining", "source_unit", {"unit": "fraction"}),
+            ("error", None, []),
+            ("error", None, "not-an-object"),
+            ("error", "kind", []),
+            ("error", "detail", 1),
+            ("window", "anomalies", "not-a-list"),
+            ("window", "anomalies", {"name": "reason"}),
+            ("window", "anomalies", [1]),
+        ]
+        for section, field, value in cases:
+            payload = copy.deepcopy(valid)
+            if section == "error" and field is None:
+                payload["error"] = value
+            elif section == "error":
+                payload["error"] = {"kind": "synthetic", "detail": "synthetic"}
+                payload["error"][field] = value
+            elif section == "window":
+                payload["windows"][0][field] = value
+            else:
+                payload["windows"][0]["remaining"][field] = value
+            with self.assertRaises(ValueError, msg=f"{section}.{field}={value!r}"):
+                Observation.from_dict(payload)
+            with self.assertRaises(ValueError, msg=f"ingest {section}.{field}={value!r}"):
+                ingest_observation(center, payload)
+
+        direct = Observation(
+            provider="agy",
+            account="personal",
+            machine="test-machine",
+            sampled_at="2026-01-01T00:00:00Z",
+            status="success",
+            windows=(
+                WindowObservation(
+                    group="Gemini",
+                    bucket_id="weekly",
+                    limit_id=[],
+                    remaining_unit=3,
+                    anomalies=(1,),
+                ),
+            ),
+            interval_seconds=900,
+            sample_id="direct-wrong-types",
+        )
+        with self.assertRaises(ValueError):
+            ingest_observation(center, direct)
+
+    def test_direct_integral_numbers_canonicalize_before_digest(self):
+        direct = Observation(
+            provider="agy",
+            account="personal",
+            machine="test-machine",
+            sampled_at="2026-01-01T00:00:00Z",
+            status="success",
+            windows=(
+                WindowObservation(
+                    group="Gemini",
+                    bucket_id="weekly",
+                    window="7d",
+                    window_minutes=10080.0,
+                    remaining_value=1,
+                    remaining_unit="fraction",
+                    remaining_display=100,
+                    reset_raw="2026-01-08T00:00:00Z",
+                    reset_at="2026-01-08T00:00:00Z",
+                ),
+            ),
+            interval_seconds=900.0,
+            sample_id="direct-integral-numbers",
+        )
+        center = self.tmp / "canonical.sqlite3"
+        self.assertTrue(ingest_observation(center, direct))
+        replay = read_observation(center, direct.sample_id)
+        self.assertIsNotNone(replay)
+        self.assertFalse(ingest_observation(center, replay))
+        self.assertFalse(ingest_observation(center, direct))
 
     def test_integer_and_numeric_persistence_limits_on_ingest_and_replay(self):
         self.sample("2026-01-01T00:00:00Z", 0.5)

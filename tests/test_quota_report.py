@@ -152,6 +152,34 @@ class CurrentReportSemanticsTest(unittest.TestCase):
         )
         self.assertEqual(stale.returncode, 3)
 
+    def test_future_date_check_does_not_pass_an_expected_account_without_coverage(self):
+        self.sample_at("2026-01-01T23:45:00Z", agy_payload(0.5))
+        report_process = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-02",
+            "--now",
+            "2026-01-01T23:50:00Z",
+            "--json",
+        )
+        self.assertEqual(report_process.returncode, 0, report_process.stderr)
+        account = json_output(report_process)["accounts"][0]
+        self.assertTrue(account["missing"])
+
+        checked = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-02",
+            "--now",
+            "2026-01-01T23:50:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 3, checked.stderr)
+
     def test_check_ignores_db_only_history_after_a_source_is_removed_from_config(self):
         write_fake_agy(self.tmp, payload=agy_payload(0.6))
         both = write_config(
