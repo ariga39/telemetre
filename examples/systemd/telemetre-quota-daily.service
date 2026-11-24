@@ -1,0 +1,20 @@
+[Unit]
+Description=telemetre: store yesterday's quota digest (configured timezone)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=telemetre
+Group=telemetre
+Environment=PYTHONPATH=/opt/telemetre
+EnvironmentFile=/etc/telemetre/center.env
+StateDirectory=telemetre
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/telemetre
+TimeoutStartSec=5min
+# No --date: the quota CLI selects yesterday in the configured timezone.
+ExecStart=/usr/bin/python3 -m telemetre.quota daily --config ${QUOTA_CENTER_CONFIG} --db ${CENTER_DB} --json

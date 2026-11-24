@@ -1,0 +1,16 @@
+{
+  "machine": "centre",
+  "timezone": "UTC",
+  "providers": [
+    {
+      "provider": "agy",
+      "account": "personal@example.test",
+      "interval_seconds": 900
+    },
+    {
+      "provider": "codex",
+      "account": "personal@example.test",
+      "interval_seconds": 900
+    }
+  ]
+}

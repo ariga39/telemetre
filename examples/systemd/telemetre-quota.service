@@ -1,0 +1,22 @@
+[Unit]
+Description=telemetre: sample quota windows and deliver each provider independently (user)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/opt/telemetre
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/telemetre/telemetre.env
+StateDirectory=telemetre
+RuntimeDirectory=telemetre
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=10min
+# A failed sample is stored as a failure observation. Each provider's send
+# uses its own key/binding and is prefixed with '-' so one failed delivery
+# never blocks the other provider.
+ExecStart=-/usr/bin/python3 -m telemetre.quota sample --config %h/.config/telemetre/quota.json --if-due
+ExecStart=-/usr/bin/python3 -m telemetre.delivery run --lock %t/telemetre/quota-agy.lock --timeout 300 -- /usr/bin/python3 -m telemetre.delivery send-quota --quota-db %S/telemetre/quota.sqlite3 --bindings %h/.config/telemetre/bindings.json --binding-id ${BINDING_ID_QUOTA_AGY} --ssh-host ${SSH_HOST} --ssh-user ${SSH_USER} --identity %h/.ssh/telemetre_quota_agy --known-hosts %h/.ssh/telemetre_known_hosts
+ExecStart=-/usr/bin/python3 -m telemetre.delivery run --lock %t/telemetre/quota-codex.lock --timeout 300 -- /usr/bin/python3 -m telemetre.delivery send-quota --quota-db %S/telemetre/quota.sqlite3 --bindings %h/.config/telemetre/bindings.json --binding-id ${BINDING_ID_QUOTA_CODEX} --ssh-host ${SSH_HOST} --ssh-user ${SSH_USER} --identity %h/.ssh/telemetre_quota_codex --known-hosts %h/.ssh/telemetre_known_hosts

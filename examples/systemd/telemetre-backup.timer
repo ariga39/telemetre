@@ -1,0 +1,12 @@
+[Unit]
+Description=telemetre: daily online backup
+After=local-fs.target
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=telemetre-backup.service
+
+[Install]
+WantedBy=timers.target

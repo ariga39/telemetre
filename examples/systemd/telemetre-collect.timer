@@ -1,0 +1,13 @@
+[Unit]
+Description=telemetre: collect agy usage (hourly)
+Wants=network-online.target
+After=network-online.target
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=telemetre-collect.service
+
+[Install]
+WantedBy=timers.target
