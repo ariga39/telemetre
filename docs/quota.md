@@ -91,9 +91,11 @@ tests and replay checks), and `--json`.
 - `report` prints the latest successful snapshot per account, plus the latest
   attempt status. With `--date`, it prints observations from that local
   calendar day. `report --check` exits 3 when an **expected** account is
-  missing, stale, or its latest attempt failed. When a config is supplied, only
-  accounts still configured are expected; accounts retained in the database
-  after removal stay visible as history but do not make the check fail.
+  missing, stale, or its latest attempt failed. A future date has no coverage
+  yet and therefore fails for expected accounts instead of passing late today.
+  When a config is supplied, only accounts still configured are expected;
+  accounts retained in the database after removal stay visible as history but
+  do not make the check fail.
 - `daily` builds the same dated summary and stores it by `(day, timezone)`.
   Re-running for the same day updates the one stored row. Without `--date`, it
   targets yesterday in the report timezone.
@@ -237,7 +239,8 @@ Dated report:
   (`Asia/Shanghai` on 2026-01-01 is `2025-12-31T16:00Z` through
   `2026-01-01T16:00Z`);
 - only stored snapshots in the range are replayed; nothing is fetched from a
-  provider;
+  provider, and gap/staleness checks use the interval recorded with those
+  samples rather than a later config change;
 - each window reports the minimum observed remaining percentage and its
   observation time, the latest value/time, observation count, and whether the
   range contains a sampling gap;
@@ -280,8 +283,9 @@ for observation in iter_observations(
     # send payload over the authenticated delivery channel
 
 # Observation.from_dict(payload) validates the shape and raises ValueError for
-# non-list windows, invalid rows, out-of-range persisted integers, and
-# non-finite or overflowing numeric values.
+# non-list windows, invalid rows, out-of-range persisted integers, non-finite or
+# overflowing numeric values, wrong optional string fields, a non-object error,
+# or malformed anomaly lists.
 
 is_new = ingest_observation(center_db, payload, received_at=None)
 # False means an idempotent replay. Raises ObservationConflict if the same

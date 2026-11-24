@@ -183,6 +183,116 @@ class DatedReportTest(unittest.TestCase):
         self.assertEqual(json_output(viewed)["date"], "2026-01-01")
 
 
+class MixedCadenceHistoryTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.db = self.tmp / "quota.sqlite3"
+        self.agy = write_fake_agy(self.tmp, payload=payload(0.5, R1))
+        self.config = write_config(
+            self.tmp,
+            [source("agy", "personal", self.agy, interval_seconds=900)],
+            database=self.db,
+            timezone="UTC",
+        )
+        self.counter = 0
+
+    def add(self, when: datetime, interval_seconds: int) -> None:
+        sampled_at = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+        observation = Observation(
+            provider="agy",
+            account="personal",
+            machine="test-machine",
+            sampled_at=sampled_at,
+            status="success",
+            windows=(
+                WindowObservation(
+                    group="Gemini",
+                    bucket_id="weekly",
+                    window="7d",
+                    window_minutes=10080,
+                    remaining_value=0.5,
+                    remaining_unit="fraction",
+                    remaining_display=50.0,
+                    reset_raw=R1,
+                    reset_at=R1,
+                ),
+            ),
+            interval_seconds=interval_seconds,
+            sample_id=f"mixed-{self.counter}",
+        )
+        self.counter += 1
+        ingest_observation(self.db, observation, received_at=when)
+
+    def report(self):
+        process = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--json",
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        return json_output(process)
+
+    def test_actual_missed_fast_segment_survives_slow_cadence_changes(self):
+        day = datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+        for index in range(24):
+            self.add(day + timedelta(minutes=15 * index), 900)
+        for minute in (0, 1, 2):
+            self.add(day + timedelta(hours=6, minutes=minute), 60)
+        self.add(day + timedelta(hours=6, minutes=5), 900)
+        for index in range(70):
+            self.add(day + timedelta(hours=6, minutes=20 + 15 * index), 900)
+        for minute in range(40, 60):
+            self.add(day + timedelta(hours=23, minutes=minute), 60)
+
+        report = self.report()
+        account = report["accounts"][0]
+        self.assertEqual(account["interval_seconds"], 60)
+        self.assertFalse(account["stale"])
+        self.assertTrue(account["missing"])
+        self.assertEqual(len(account["missing_gaps"]), 1)
+        self.assertEqual(
+            account["missing_gaps"][0]["from"], "2026-01-01T06:02:00Z"
+        )
+        self.assertEqual(
+            account["missing_gaps"][0]["to"], "2026-01-01T06:05:00Z"
+        )
+        self.assertTrue(account["windows"][0]["has_gap"])
+
+    def test_healthy_slow_segments_with_a_fast_tail_have_no_gaps(self):
+        day = datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+        for index in range(95):
+            self.add(day + timedelta(minutes=15 * index), 900)
+        for minute in range(35, 60):
+            self.add(day + timedelta(hours=23, minutes=minute), 60)
+
+        report = self.report()
+        account = report["accounts"][0]
+        self.assertEqual(account["interval_seconds"], 60)
+        self.assertFalse(account["missing"])
+        self.assertEqual(account["missing_gaps"], [])
+        self.assertFalse(account["stale"])
+        self.assertFalse(account["windows"][0]["has_gap"])
+
+        checked = run_cli(
+            "report",
+            "--config",
+            self.config,
+            "--date",
+            "2026-01-01",
+            "--now",
+            "2026-01-02T00:10:00Z",
+            "--check",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+
 class PeriodEndStalenessTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

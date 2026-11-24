@@ -1450,11 +1450,12 @@ def _change_for_window(
     row: sqlite3.Row,
     current_sampled_at: str,
     current_epoch: float,
-    interval_seconds: int,
 ) -> dict | None:
     previous = connection.execute(
         """
-        SELECT w.*, s.sampled_at AS sample_sampled_at, s.sampled_epoch AS sample_sampled_epoch
+        SELECT w.*, s.sampled_at AS sample_sampled_at,
+               s.sampled_epoch AS sample_sampled_epoch,
+               s.interval_seconds AS sample_interval_seconds
         FROM quota_windows w
         JOIN quota_samples s ON s.sample_id = w.sample_id
         WHERE s.provider = ? AND s.account = ? AND s.status = 'success'
@@ -1496,7 +1497,7 @@ def _change_for_window(
             "previous_sampled_at": previous_at,
         }
     gap = current_epoch - float(previous["sample_sampled_epoch"])
-    if gap > STALE_INTERVALS * interval_seconds:
+    if gap > STALE_INTERVALS * int(previous["sample_interval_seconds"]):
         return {
             "comparable": False,
             "reason": "sampling_gap",
@@ -1585,7 +1586,6 @@ def current_report(
                         row=row,
                         current_sampled_at=success["sampled_at"],
                         current_epoch=float(success["sampled_epoch"]),
-                        interval_seconds=interval,
                     )
                     windows.append(
                         _public_window(
@@ -1900,17 +1900,26 @@ def _date_range(day: str, tz_name: str, now: Any = None):
 
 
 def _missing_gaps(
-    attempt_epochs: Sequence[float],
+    attempts: Sequence[tuple[float, int]],
     start: datetime,
     end: datetime,
-    interval_seconds: int,
+    *,
+    start_interval_seconds: int,
 ) -> list[dict]:
-    threshold = STALE_INTERVALS * interval_seconds
+    """Find missed coverage using each segment's actual recorded cadence.
+
+    The interval preceding a segment governs that segment.  The starting
+    boundary uses the last sample before the period (or the first sample in
+    it), and the trailing boundary uses the most recent recorded interval.
+    """
+
+    if end <= start:
+        return []
     gaps: list[dict] = []
 
-    def add_gap(from_dt: datetime, to_dt: datetime) -> None:
+    def add_gap(from_dt: datetime, to_dt: datetime, interval_seconds: int) -> None:
         seconds = int((to_dt - from_dt).total_seconds())
-        if seconds > threshold:
+        if seconds > STALE_INTERVALS * interval_seconds:
             gaps.append(
                 {
                     "from": format_timestamp(from_dt),
@@ -1919,23 +1928,32 @@ def _missing_gaps(
                 }
             )
 
-    if not attempt_epochs:
-        add_gap(start, end)
+    if not attempts:
+        seconds = int((end - start).total_seconds())
+        gaps.append(
+            {
+                "from": format_timestamp(start),
+                "to": format_timestamp(end),
+                "seconds": seconds,
+            }
+        )
         return gaps
-    first = datetime.fromtimestamp(attempt_epochs[0], tz=UTC)
-    add_gap(start, first)
+
+    first_epoch, first_interval = attempts[0]
+    first = datetime.fromtimestamp(first_epoch, tz=UTC)
+    add_gap(start, first, start_interval_seconds)
     previous = first
-    for epoch in attempt_epochs[1:]:
+    previous_interval = first_interval
+    for epoch, interval in attempts[1:]:
         current = datetime.fromtimestamp(epoch, tz=UTC)
-        add_gap(previous, current)
+        add_gap(previous, current, previous_interval)
         previous = current
-    add_gap(previous, end)
+        previous_interval = interval
+    add_gap(previous, end, previous_interval)
     return gaps
 
 
-def _date_window(
-    identity: tuple, observations: list[dict], interval_seconds: int
-) -> dict:
+def _date_window(identity: tuple, observations: list[dict]) -> dict:
     first = observations[0]
     last = observations[-1]
     known = [item for item in observations if item["display"] is not None]
@@ -1953,17 +1971,20 @@ def _date_window(
     segments = 0
     zero_state: bool | None = None
     previous_epoch: float | None = None
+    previous_interval: int | None = None
     has_gap = False
     for item in observations:
         epoch = item["epoch"]
         display = item["display"]
         gap = (
             previous_epoch is not None
-            and epoch - previous_epoch > STALE_INTERVALS * interval_seconds
+            and previous_interval is not None
+            and epoch - previous_epoch > STALE_INTERVALS * previous_interval
         )
         if gap:
             has_gap = True
         previous_epoch = epoch
+        previous_interval = item["interval_seconds"]
         if display is None:
             continue
         is_zero = display <= 0.0
@@ -2074,14 +2095,35 @@ def date_report(
                 """,
                 (provider, account, start_epoch, end_epoch),
             ).fetchall()
+            prior_before_start = connection.execute(
+                """
+                SELECT * FROM quota_samples
+                WHERE provider = ? AND account = ? AND sampled_epoch < ?
+                ORDER BY sampled_epoch DESC, received_epoch DESC, sample_id DESC
+                LIMIT 1
+                """,
+                (provider, account, start_epoch),
+            ).fetchone()
+            attempts = [
+                (float(row["sampled_epoch"]), int(row["interval_seconds"]))
+                for row in rows
+            ]
+            if prior_before_start is not None:
+                start_interval = int(prior_before_start["interval_seconds"])
+            elif attempts:
+                start_interval = attempts[0][1]
+            elif latest_sample_before_end is not None:
+                start_interval = int(latest_sample_before_end["interval_seconds"])
+            else:
+                start_interval = configured.get((provider, account)) or DEFAULT_INTERVAL_SECONDS
             success_rows = [row for row in rows if row["status"] == "success"]
             last_attempt_row = rows[-1] if rows else None
             last_success_row = success_rows[-1] if success_rows else None
             gaps = _missing_gaps(
-                [float(row["sampled_epoch"]) for row in rows],
+                attempts,
                 start,
                 end,
-                interval,
+                start_interval_seconds=start_interval,
             )
             no_coverage_period = end <= start
             last_attempt = None
@@ -2113,6 +2155,7 @@ def date_report(
                     grouped.setdefault(identity, []).append(
                         {
                             "epoch": float(row["sampled_epoch"]),
+                            "interval_seconds": int(row["interval_seconds"]),
                             "sampled_at": row["sampled_at"],
                             "machine": row["machine"],
                             "group": window["group_name"],
@@ -2131,7 +2174,7 @@ def date_report(
                         }
                     )
             windows = [
-                _date_window(identity, observations, interval)
+                _date_window(identity, observations)
                 for identity, observations in sorted(
                     grouped.items(),
                     key=lambda item: tuple(
