@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -184,6 +185,51 @@ class SpoolDiagnosticsTest(unittest.TestCase):
             })
             self.assertEqual(report["sources"][0]["bad_lines"], 1)
 
+    def test_oversized_local_integer_is_bad_line_and_later_rows_still_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            write_transcript(
+                root,
+                "conv-overflow",
+                [
+                    model_step(
+                        0,
+                        "2026-11-22T00:00:00Z",
+                        input_tokens=10,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    ),
+                    model_step(
+                        1,
+                        "2026-11-22T00:01:00Z",
+                        input_tokens=2**63,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    ),
+                    model_step(
+                        2,
+                        "2026-11-22T00:02:00Z",
+                        input_tokens=30,
+                        cache_read_tokens=3,
+                        output_tokens=4,
+                    ),
+                ],
+            )
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["bad_lines"], 1)
+            self.assertEqual(collected["new_facts"], 2)
+            _replay(base, client, center)
+            account = _report(center)["accounts"]["acct"]
+            self.assertEqual(account["account_total"], {
+                "input_tokens": 40,
+                "cache_read_tokens": 4,
+                "output_tokens": 6,
+                "model_steps": 2,
+            })
+
     def test_source_deleted_after_collection_and_lost_ack_do_not_lose_or_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -352,8 +398,56 @@ class SpoolDiagnosticsTest(unittest.TestCase):
             _replay(base, client, center)
             report = _report(center)
             self.assertEqual(report["sources"][0]["source_errors"], 1)
-            status = cli_json(
-                run_cli(
+            self.assertEqual(report["sources"][0]["files_seen"], 1)
+            self.assertEqual(report["sources"][0]["files_read"], 0)
+            status = run_cli(
+                "status",
+                "--center-db",
+                str(center),
+                "--expected",
+                "alpha:acct",
+                "--format",
+                "json",
+            )
+            self.assertEqual(status.returncode, 1)
+            check = json.loads(status.stdout)["checks"][0]
+            self.assertFalse(check["ok"])
+            self.assertEqual(check["source_errors"], 1)
+            self.assertEqual(check["files_seen"], 1)
+            self.assertEqual(check["files_read"], 0)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "permissions do not block root")
+    def test_unreadable_directory_is_observed_and_fails_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            write_transcript(
+                root,
+                "conv-hidden",
+                [
+                    model_step(
+                        0,
+                        "2026-11-23T00:00:00Z",
+                        input_tokens=1,
+                        cache_read_tokens=2,
+                        output_tokens=3,
+                    )
+                ],
+            )
+            locked = root / "brain" / "conv-hidden"
+            locked.chmod(0o000)
+            try:
+                client = base / "client.sqlite"
+                center = base / "center.sqlite"
+                collected = _collect(base, root, client)
+                self.assertGreaterEqual(collected["source_errors"], 1)
+                self.assertEqual(collected["files_seen"], 0)
+                _replay(base, client, center)
+                source = _report(center)["sources"][0]
+                self.assertGreaterEqual(source["source_errors"], 1)
+                self.assertEqual(source["files_seen"], 0)
+                self.assertEqual(source["files_read"], 0)
+                status = run_cli(
                     "status",
                     "--center-db",
                     str(center),
@@ -362,8 +456,40 @@ class SpoolDiagnosticsTest(unittest.TestCase):
                     "--format",
                     "json",
                 )
+                self.assertEqual(status.returncode, 1)
+                check = json.loads(status.stdout)["checks"][0]
+                self.assertFalse(check["ok"])
+                self.assertEqual(check["reason"], "source read/traversal errors")
+            finally:
+                locked.chmod(0o755)
+
+    def test_healthy_zero_use_scan_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            (root / "brain").mkdir(parents=True)
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["files_seen"], 0)
+            self.assertEqual(collected["files_read"], 0)
+            self.assertEqual(collected["source_errors"], 0)
+            _replay(base, client, center)
+            source = _report(center)["sources"][0]
+            self.assertEqual(source["files_seen"], 0)
+            self.assertEqual(source["files_read"], 0)
+            self.assertEqual(source["source_errors"], 0)
+            status = run_cli(
+                "status",
+                "--center-db",
+                str(center),
+                "--expected",
+                "alpha:acct",
+                "--format",
+                "json",
             )
-            self.assertEqual(status["checks"][0]["source_errors"], 1)
+            self.assertEqual(status.returncode, 0, status.stdout.decode())
+            self.assertTrue(json.loads(status.stdout)["ok"])
 
     def test_status_only_run_is_reported_and_expected_source_gate_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -415,6 +541,9 @@ class SpoolDiagnosticsTest(unittest.TestCase):
             )
             self.assertTrue(status["ok"])
             self.assertEqual(status["checks"][0]["bad_lines"], 0)
+            self.assertEqual(status["checks"][0]["files_seen"], 1)
+            self.assertEqual(status["checks"][0]["files_read"], 0)
+            self.assertEqual(status["checks"][0]["source_errors"], 0)
 
             absent = run_cli(
                 "status",

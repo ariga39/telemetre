@@ -17,6 +17,8 @@ from .timeutil import parse_rfc3339, to_us, utc_text
 PROTOCOL_VERSION = 1
 KIND_AGY_USAGE = "agy_usage"
 COUNT_FIELDS = ("input_tokens", "cache_read_tokens", "output_tokens")
+MAX_SQLITE_INT = 2**63 - 1
+MIN_SQLITE_INT = -(2**63)
 SCAN_INT_FIELDS = (
     "files_seen",
     "files_read",
@@ -56,8 +58,8 @@ def _count(value: Any, field: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise ProtocolError(f"{field} must be a non-negative integer or null")
-    if value < 0:
-        raise ProtocolError(f"{field} must be a non-negative integer or null")
+    if value < 0 or value > MAX_SQLITE_INT:
+        raise ProtocolError(f"{field} must fit a non-negative SQLite integer")
     return value
 
 
@@ -66,11 +68,18 @@ def normalize_fact(raw: Any, index: int = 0) -> dict[str, Any]:
         raise ProtocolError(f"facts[{index}] must be an object")
     conversation_id = _require_text(raw.get("conversation_id"), "conversation_id")
     step_index = raw.get("step_index")
-    if isinstance(step_index, bool) or not isinstance(step_index, int) or step_index < 0:
-        raise ProtocolError("step_index must be a non-negative integer")
+    if (
+        isinstance(step_index, bool)
+        or not isinstance(step_index, int)
+        or step_index < 0
+        or step_index > MAX_SQLITE_INT
+    ):
+        raise ProtocolError("step_index must fit a non-negative SQLite integer")
     model = _require_text(raw.get("model"), "model")
     event_text = _require_text(raw.get("event_time"), "event_time")
     event_us = to_us(parse_rfc3339(event_text))
+    if event_us < MIN_SQLITE_INT or event_us > MAX_SQLITE_INT:
+        raise ProtocolError("event_time is outside the SQLite integer range")
     fact = {
         "conversation_id": conversation_id,
         "step_index": step_index,
@@ -110,8 +119,13 @@ def normalize_scan(raw: Any) -> dict[str, Any] | None:
     }
     for field in SCAN_INT_FIELDS:
         value = raw.get(field, 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ProtocolError(f"scan.{field} must be a non-negative integer")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > MAX_SQLITE_INT
+        ):
+            raise ProtocolError(f"scan.{field} must fit a non-negative SQLite integer")
         scan[field] = value
     version = raw.get("collector_version")
     if version is not None and not isinstance(version, str):

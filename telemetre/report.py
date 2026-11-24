@@ -63,6 +63,8 @@ def _sources_for_account(conn: Any, account: str) -> list[dict[str, Any]]:
                 "last_success_at": row["last_success_at"],
                 "collector_version": row["collector_version"],
                 "bad_lines": scan.get("bad_lines", 0),
+                "files_seen": scan.get("files_seen", 0),
+                "files_read": scan.get("files_read", 0),
                 "missing_count_steps": scan.get("missing_count_steps", 0),
                 "pending_backlog": scan.get("pending_backlog", 0),
                 "source_missing": bool(scan.get("source_missing", 0)),
@@ -113,6 +115,15 @@ def build_report(center_db: str | Path, *, month: str, tz_name: str = "UTC") -> 
             "ORDER BY account, machine, model, event_us, conversation_id, step_index",
             (start_us, end_us),
         ).fetchall()
+        observation_conflicts = conn.execute(
+            "SELECT DISTINCT e.account, e.conversation_id, e.step_index, e.event_us, "
+            "e.event_time, e.model, e.input_tokens, e.cache_read_tokens, e.output_tokens, "
+            "e.status, e.machine, e.created_at, e.updated_at "
+            "FROM events e JOIN observations o ON e.account = o.account "
+            "AND e.conversation_id = o.conversation_id AND e.step_index = o.step_index "
+            "WHERE e.status = 'conflict' AND o.event_us >= ? AND o.event_us < ?",
+            (start_us, end_us),
+        ).fetchall()
         status_rows = conn.execute(
             "SELECT DISTINCT account FROM machine_status ORDER BY account"
         ).fetchall()
@@ -120,12 +131,34 @@ def build_report(center_db: str | Path, *, month: str, tz_name: str = "UTC") -> 
             "SELECT * FROM machine_status ORDER BY account, machine"
         ).fetchall()
 
+        conflict_by_key = {
+            (row["account"], row["conversation_id"], row["step_index"]): row
+            for row in events
+            if row["status"] == "conflict"
+        }
+        for row in observation_conflicts:
+            conflict_by_key[(row["account"], row["conversation_id"], row["step_index"])] = row
+
         accounts: dict[str, Any] = {}
-        account_names = {row["account"] for row in events} | {row["account"] for row in status_rows}
+        account_names = (
+            {row["account"] for row in events}
+            | {row["account"] for row in conflict_by_key.values()}
+            | {row["account"] for row in status_rows}
+        )
         for account in sorted(account_names):
-            account_events = [event for event in events if event["account"] == account]
-            known_events = [event for event in account_events if event["status"] != "conflict"]
-            conflict_events = [event for event in account_events if event["status"] == "conflict"]
+            known_events = [
+                event
+                for event in events
+                if event["account"] == account and event["status"] != "conflict"
+            ]
+            conflict_events = sorted(
+                (
+                    row
+                    for (row_account, _, _), row in conflict_by_key.items()
+                    if row_account == account
+                ),
+                key=lambda row: (row["conversation_id"], row["step_index"]),
+            )
             ambiguous_events = [event for event in known_events if event["status"] == "ambiguous"]
 
             machine_models: dict[tuple[str, str], dict[str, Any]] = {}
@@ -203,6 +236,8 @@ def build_report(center_db: str | Path, *, month: str, tz_name: str = "UTC") -> 
                 "last_success_at": row["last_success_at"],
                 "collector_version": row["collector_version"],
                 "bad_lines": scan.get("bad_lines", 0),
+                "files_seen": scan.get("files_seen", 0),
+                "files_read": scan.get("files_read", 0),
                 "missing_count_steps": scan.get("missing_count_steps", 0),
                 "pending_backlog": scan.get("pending_backlog", 0),
                 "source_missing": bool(scan.get("source_missing", 0)),
@@ -294,7 +329,9 @@ def render_text(report: dict[str, Any]) -> str:
     for source in report.get("sources", []):
         lines.append(
             f"  {source['machine']}/{source['account']}: last successful scan "
-            f"{source['last_success_at'] or 'never'}, bad_lines={source['bad_lines']}, "
+            f"{source['last_success_at'] or 'never'}, "
+            f"files_seen={source['files_seen']}, files_read={source['files_read']}, "
+            f"bad_lines={source['bad_lines']}, "
             f"missing_count_steps={source['missing_count_steps']}, "
             f"pending_backlog={source['pending_backlog']}, "
             f"source_errors={source['source_errors']}, "

@@ -65,6 +65,8 @@ def check_status(
             reason = "no successful scan reported"
         if scan.get("source_missing"):
             reason = "expected source missing"
+        elif int(scan.get("source_errors", 0) or 0) > 0:
+            reason = "source read/traversal errors"
         if max_age_seconds is not None and age_seconds is not None and age_seconds > max_age_seconds:
             reason = "stale scan"
         if reason != "ok":
@@ -77,6 +79,8 @@ def check_status(
                 "reason": reason,
                 "last_success_at": last_success,
                 "age_seconds": age_seconds,
+                "files_seen": scan.get("files_seen", 0),
+                "files_read": scan.get("files_read", 0),
                 "bad_lines": scan.get("bad_lines", 0),
                 "missing_count_steps": scan.get("missing_count_steps", 0),
                 "pending_backlog": scan.get("pending_backlog", 0),
@@ -104,6 +108,8 @@ def render_status_text(status: dict[str, Any]) -> str:
             f"  {check['machine']}/{check['account']}: "
             f"{state} "
             f"last_success={check.get('last_success_at') or 'never'} "
+            f"files_seen={check.get('files_seen', 0)} "
+            f"files_read={check.get('files_read', 0)} "
             f"bad_lines={check.get('bad_lines', 0)} "
             f"missing_count_steps={check.get('missing_count_steps', 0)} "
             f"pending_backlog={check.get('pending_backlog', 0)} "

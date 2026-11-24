@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,8 +35,50 @@ class ScanCounters:
     roots: list[str] = field(default_factory=list)
 
 
-def _transcript_paths(root: Path) -> list[Path]:
-    return sorted(root.glob("brain/*/.system_generated/logs/transcript.jsonl"))
+def _safe_scandir(path: Path) -> list[os.DirEntry[str]] | None:
+    """Return directory entries, or None when traversal failed.
+
+    ``Path.glob`` silently skips unreadable directories.  Explicit scandir
+    failures are counted so a partially scanned source never looks healthy.
+    A missing path is an ordinary zero-use result, not a failure.
+    """
+    try:
+        with os.scandir(path) as entries:
+            return list(entries)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError:
+        return None
+
+
+def _transcript_paths(root: Path, counters: ScanCounters) -> list[Path]:
+    brain_entries = _safe_scandir(root / "brain")
+    if brain_entries is None:
+        counters.source_errors += 1
+        return []
+    paths: list[Path] = []
+    for conversation in brain_entries:
+        try:
+            if not conversation.is_dir():
+                continue
+        except OSError:
+            counters.source_errors += 1
+            continue
+        system_entries = _safe_scandir(Path(conversation.path) / ".system_generated")
+        if system_entries is None:
+            counters.source_errors += 1
+            continue
+        for system_entry in system_entries:
+            if system_entry.name != "logs":
+                continue
+            logs_entries = _safe_scandir(Path(system_entry.path))
+            if logs_entries is None:
+                counters.source_errors += 1
+                continue
+            for logs_entry in logs_entries:
+                if logs_entry.name == "transcript.jsonl":
+                    paths.append(Path(logs_entry.path))
+    return sorted(paths)
 
 
 def _complete_lines(data: bytes) -> tuple[list[bytes], bool]:
@@ -155,7 +198,7 @@ def collect(
                 if not root.is_dir():
                     counters.source_missing = True
                     continue
-                for transcript in _transcript_paths(root):
+                for transcript in _transcript_paths(root, counters):
                     counters.files_seen += 1
                     conversation_id = transcript.parents[2].name
                     try:

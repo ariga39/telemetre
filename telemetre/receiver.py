@@ -85,6 +85,13 @@ def _merge_event(
     ).fetchone()
 
     conflict = bool(existing is not None and existing["status"] == "conflict")
+    if existing is not None:
+        # The identity also fixes the model and event month.  A different model
+        # or instant is conflicting evidence, never a first-seen overwrite.
+        if fact["model"] != existing["model"]:
+            conflict = True
+        if fact["event_us"] != existing["event_us"]:
+            conflict = True
     values: dict[str, int | None] = {}
     for field in COUNT_FIELDS:
         old_value = None if existing is None else existing[field]
@@ -199,7 +206,7 @@ def receive(
         raise ProtocolError(f"batch is {len(raw)} bytes, limit is {max_bytes}")
     try:
         payload = json.loads(bytes(raw).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ProtocolError(f"invalid batch JSON: {exc}") from exc
     facts, scan, collector_version = validate_batch(payload, context, max_rows=max_rows)
 

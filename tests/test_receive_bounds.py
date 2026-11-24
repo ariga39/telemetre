@@ -122,6 +122,50 @@ class ReceiveBoundsTest(unittest.TestCase):
             )
             self.assertEqual(empty["accounts"], {})
 
+    def test_json_shape_and_sqlite_overflow_are_generic_receive_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = self._spool_three(base)
+            valid = json.loads(run_cli("pending", "--client-db", str(client)).stdout)
+            huge_fact_count = json.loads(json.dumps(valid))
+            huge_fact_count["facts"][0]["input_tokens"] = 2**63
+            huge_step = json.loads(json.dumps(valid))
+            huge_step["facts"][0]["step_index"] = 2**63
+            huge_scan = json.loads(json.dumps(valid))
+            huge_scan["scan"]["files_seen"] = 2**63
+            cases = [
+                b"{",
+                b"[]",
+                b'{"protocol":1,"kind":"agy_usage","facts":"not-a-list"}',
+                json.dumps(huge_fact_count).encode(),
+                json.dumps(huge_step).encode(),
+                json.dumps(huge_scan).encode(),
+            ]
+            center = base / "center.sqlite"
+            for raw in cases:
+                with self.subTest(raw=raw[:80]):
+                    result = self._receive(center, raw)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(
+                        json.loads(result.stdout)["error"],
+                        "invalid batch",
+                    )
+                    combined = result.stdout + result.stderr
+                    self.assertNotIn(b"Traceback", combined)
+                    self.assertNotIn(b"Overflow", combined)
+            empty = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-11",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(empty["accounts"], {})
+
     def test_payload_identity_claim_is_ignored_and_kind_must_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

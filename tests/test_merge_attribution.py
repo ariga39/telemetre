@@ -181,6 +181,107 @@ class MergeAttributionTest(unittest.TestCase):
             self.assertEqual(len(account["unattributed"]), 1)
             self.assertEqual(account["unattributed"][0]["sources"], ["alpha", "beta"])
 
+    def test_same_key_changed_model_is_conflict_even_when_counts_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            center = base / "center.sqlite"
+            for machine, model in (("alpha", "model-a"), ("beta", "model-b")):
+                root = base / machine
+                write_transcript(
+                    root,
+                    "conv-model-change",
+                    [
+                        model_step(
+                            0,
+                            "2026-11-16T00:00:00Z",
+                            model=model,
+                            input_tokens=10,
+                            cache_read_tokens=1,
+                            output_tokens=2,
+                        )
+                    ],
+                )
+                client = base / f"{machine}.sqlite"
+                _collect(root, client, machine)
+                _replay(client, center, machine)
+
+            account = _report(center)["accounts"]["acct"]
+            self.assertEqual(account["account_total"]["model_steps"], 0)
+            self.assertEqual(account["machines"], [])
+            self.assertEqual(account["unattributed"], [])
+            self.assertEqual(len(account["conflicts"]), 1)
+            conflict = account["conflicts"][0]
+            self.assertEqual(
+                sorted(row["model"] for row in conflict["observations"]),
+                ["model-a", "model-b"],
+            )
+
+    def test_same_key_changed_event_time_is_conflict_in_both_months(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            center = base / "center.sqlite"
+            for machine, event_time in (
+                ("alpha", "2026-01-15T00:00:00Z"),
+                ("beta", "2026-02-15T00:00:00Z"),
+            ):
+                root = base / machine
+                write_transcript(
+                    root,
+                    "conv-time-change",
+                    [
+                        model_step(
+                            0,
+                            event_time,
+                            input_tokens=10,
+                            cache_read_tokens=1,
+                            output_tokens=2,
+                        )
+                    ],
+                )
+                client = base / f"{machine}.sqlite"
+                _collect(root, client, machine)
+                _replay(client, center, machine)
+
+            january = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-01",
+                    "--tz",
+                    "UTC",
+                    "--format",
+                    "json",
+                )
+            )["accounts"]["acct"]
+            self.assertEqual(january["account_total"]["model_steps"], 0)
+            self.assertEqual(len(january["conflicts"]), 1)
+            self.assertEqual(
+                sorted(row["event_time"] for row in january["conflicts"][0]["observations"]),
+                ["2026-01-15T00:00:00Z", "2026-02-15T00:00:00Z"],
+            )
+
+            february = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-02",
+                    "--tz",
+                    "UTC",
+                    "--format",
+                    "json",
+                )
+            )["accounts"]["acct"]
+            self.assertEqual(february["account_total"]["model_steps"], 0)
+            self.assertEqual(len(february["conflicts"]), 1)
+            self.assertEqual(
+                sorted(row["event_time"] for row in february["conflicts"][0]["observations"]),
+                ["2026-01-15T00:00:00Z", "2026-02-15T00:00:00Z"],
+            )
+
     def test_same_machine_reused_step_index_with_different_counts_is_conflict(self) -> None:
         """Fork/rewind handling is deliberately conservative, not claimed exact.
 

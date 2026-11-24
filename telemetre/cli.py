@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"telemetre: protocol error: {exc}", file=sys.stderr)
         return 2
-    except (CollectorError, ReplayError, ValueError, sqlite3.Error, OSError) as exc:
+    except (CollectorError, ReplayError, ValueError, OverflowError, sqlite3.Error, OSError) as exc:
         if args.command == "receive":
             print(json.dumps({"ok": False, "error": "receive failed"}, ensure_ascii=False))
         else:
