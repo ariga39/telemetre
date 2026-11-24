@@ -122,12 +122,21 @@ class ReplayGuardTest(unittest.TestCase):
             base = Path(tmp)
             client = self._collect_one(base)
             bad_acks = [
-                {"ok": True, "accepted": 0, "kind": "agy_usage", "machine": "alpha", "account": "acct"},
-                {"ok": True, "accepted": 1, "kind": "agy_usage", "machine": "beta", "account": "acct"},
-                {"ok": True, "accepted": 1, "kind": "agy_usage", "machine": "alpha", "account": "other"},
-                {"ok": True, "accepted": 1, "kind": "quota", "machine": "alpha", "account": "acct"},
-                {"ok": True, "accepted": 1, "kind": "agy_usage", "machine": "alpha"},
-                {"ok": True, "kind": "agy_usage", "machine": "alpha", "account": "acct"},
+                {"ok": True, "accepted": 0, "stored": 0, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "alpha", "account": "acct"},
+                {"ok": True, "accepted": 1, "stored": 1, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "beta", "account": "acct"},
+                {"ok": True, "accepted": 1, "stored": 1, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "alpha", "account": "other"},
+                {"ok": True, "accepted": 1, "stored": 1, "duplicates": 0,
+                 "kind": "quota", "machine": "alpha", "account": "acct"},
+                {"ok": True, "accepted": 1, "stored": 1, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "alpha"},
+                {"ok": True, "stored": 1, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "alpha", "account": "acct"},
+                {"ok": True, "accepted": 1, "stored": 1, "duplicates": 0,
+                 "kind": "agy_usage", "machine": "alpha", "account": "acct",
+                 "conflicts": None},
             ]
             for ack in bad_acks:
                 with self.subTest(ack=ack):
@@ -147,6 +156,72 @@ class ReplayGuardTest(unittest.TestCase):
                 max_bytes=64 * 1024,
             )
             self.assertEqual(build_next_batch(client, max_rows=10).fact_count, 0)
+
+    def test_public_replay_rejects_inconsistent_counters_then_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = self._collect_one(base)
+            identity = {
+                "ok": True,
+                "accepted": 1,
+                "kind": "agy_usage",
+                "machine": "alpha",
+                "account": "acct",
+            }
+            contradictory = [
+                {**identity, "stored": 0, "duplicates": 0},
+                {**identity, "stored": 1, "duplicates": 1},
+                {**identity, "stored": 1},
+                {**identity, "duplicates": 0},
+            ]
+            for ack in contradictory:
+                with self.subTest(ack=ack):
+                    with self.assertRaises(ReplayError):
+                        replay_pending(
+                            client,
+                            _BadAckTransport(ack),
+                            max_rows=10,
+                            max_bytes=64 * 1024,
+                        )
+                    self.assertEqual(build_next_batch(client, max_rows=10).fact_count, 1)
+
+            center = base / "center.sqlite"
+            replayed = cli_json(
+                run_cli(
+                    "replay",
+                    "--client-db",
+                    str(client),
+                    "--center-db",
+                    str(center),
+                    "--machine",
+                    "alpha",
+                    "--account",
+                    "acct",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(replayed["deleted_pending"], 1)
+            report = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-11",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(report["accounts"]["acct"]["account_total"]["model_steps"], 1)
+
+            # Status-only ACK semantics: accepted/stored/duplicates are all 0.
+            replay_pending(
+                client,
+                _MatchingAckTransport(),
+                max_rows=10,
+                max_bytes=64 * 1024,
+            )
 
     def test_single_fact_over_cap_fails_clearly_and_retains(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

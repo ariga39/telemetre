@@ -206,7 +206,7 @@ def receive(
         raise ProtocolError(f"batch is {len(raw)} bytes, limit is {max_bytes}")
     try:
         payload = json.loads(bytes(raw).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ProtocolError(f"invalid batch JSON: {exc}") from exc
     facts, scan, collector_version = validate_batch(payload, context, max_rows=max_rows)
 

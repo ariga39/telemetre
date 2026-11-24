@@ -377,6 +377,171 @@ class SpoolDiagnosticsTest(unittest.TestCase):
                 newer["scan"]["completed_at"],
             )
 
+    def test_deep_json_bad_line_does_not_block_later_valid_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            path = write_transcript(
+                root,
+                "conv-deep",
+                [
+                    model_step(
+                        0,
+                        "2026-11-24T00:00:00Z",
+                        input_tokens=10,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    )
+                ],
+            )
+            append_raw(path, "[" * 10_000 + "]" * 10_000 + "\n")
+            append_raw(
+                path,
+                json.dumps(
+                    model_step(
+                        1,
+                        "2026-11-24T00:01:00Z",
+                        input_tokens=20,
+                        cache_read_tokens=2,
+                        output_tokens=3,
+                    ),
+                    separators=(",", ":"),
+                )
+                + "\n",
+            )
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["bad_lines"], 1)
+            self.assertEqual(collected["new_facts"], 2)
+            _replay(base, client, center)
+            account = _report(center)["accounts"]["acct"]
+            self.assertEqual(account["account_total"], {
+                "input_tokens": 30,
+                "cache_read_tokens": 3,
+                "output_tokens": 5,
+                "model_steps": 2,
+            })
+
+    def test_oversized_numeric_literal_bad_line_does_not_block_later_valid_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            path = write_transcript(
+                root,
+                "conv-numeric",
+                [
+                    model_step(
+                        0,
+                        "2026-11-24T01:00:00Z",
+                        input_tokens=10,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    )
+                ],
+            )
+            oversized = json.dumps(
+                model_step(
+                    1,
+                    "2026-11-24T01:01:00Z",
+                    cache_read_tokens=2,
+                    output_tokens=3,
+                    include=("cache_read_tokens", "output_tokens"),
+                ),
+                separators=(",", ":"),
+            )
+            append_raw(path, oversized[:-1] + ',"input_tokens":' + "9" * 5000 + "}\n")
+            append_raw(
+                path,
+                json.dumps(
+                    model_step(
+                        2,
+                        "2026-11-24T01:02:00Z",
+                        input_tokens=30,
+                        cache_read_tokens=3,
+                        output_tokens=4,
+                    ),
+                    separators=(",", ":"),
+                )
+                + "\n",
+            )
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["bad_lines"], 1)
+            self.assertEqual(collected["new_facts"], 2)
+            _replay(base, client, center)
+            account = _report(center)["accounts"]["acct"]
+            self.assertEqual(account["account_total"], {
+                "input_tokens": 40,
+                "cache_read_tokens": 4,
+                "output_tokens": 6,
+                "model_steps": 2,
+            })
+
+    def test_regular_file_root_and_brain_are_source_errors_and_unhealthy(self) -> None:
+        for label, make_bad_path in (
+            ("root", lambda base: (base / "root").write_text("not a directory")),
+            (
+                "brain",
+                lambda base: (
+                    (base / "root").mkdir(),
+                    (base / "root" / "brain").write_text("not a directory"),
+                ),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                make_bad_path(base)
+                client = base / "client.sqlite"
+                center = base / "center.sqlite"
+                collected = _collect(base, base / "root", client)
+                self.assertGreaterEqual(collected["source_errors"], 1)
+                self.assertFalse(collected["source_missing"])
+                self.assertEqual(collected["files_seen"], 0)
+                _replay(base, client, center)
+                source = _report(center)["sources"][0]
+                self.assertGreaterEqual(source["source_errors"], 1)
+                status = run_cli(
+                    "status",
+                    "--center-db",
+                    str(center),
+                    "--expected",
+                    "alpha:acct",
+                    "--format",
+                    "json",
+                )
+                self.assertEqual(status.returncode, 1)
+                check = json.loads(status.stdout)["checks"][0]
+                self.assertFalse(check["ok"])
+                self.assertEqual(check["reason"], "source read/traversal errors")
+
+    def test_missing_brain_branch_is_healthy_zero_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            root.mkdir()
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["source_errors"], 0)
+            self.assertFalse(collected["source_missing"])
+            self.assertEqual(collected["files_seen"], 0)
+            _replay(base, client, center)
+            source = _report(center)["sources"][0]
+            self.assertEqual(source["source_errors"], 0)
+            status = run_cli(
+                "status",
+                "--center-db",
+                str(center),
+                "--expected",
+                "alpha:acct",
+                "--format",
+                "json",
+            )
+            self.assertEqual(status.returncode, 0, status.stdout.decode())
+            self.assertTrue(json.loads(status.stdout)["ok"])
+
     def test_source_read_error_is_exposed_in_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

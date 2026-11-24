@@ -32,9 +32,6 @@ class ReplayError(RuntimeError):
     """A delivery or acknowledgement failure that must not delete spool rows."""
 
 
-ACK_COUNTERS = ("accepted", "stored", "duplicates", "conflicts")
-
-
 def _validate_ack(
     ack: Any,
     *,
@@ -47,17 +44,29 @@ def _validate_ack(
         raise ReplayError("receiver acknowledgement rejected: not an object")
     if ack.get("ok") is not True:
         raise ReplayError("receiver acknowledgement rejected: not acknowledged")
-    for field in ACK_COUNTERS:
+    for field in ("accepted", "stored", "duplicates"):
         if field not in ack:
-            continue
+            raise ReplayError(
+                f"receiver acknowledgement rejected: {field} is missing"
+            )
         value = ack[field]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ReplayError(
                 f"receiver acknowledgement rejected: {field} is not a non-negative integer"
             )
-    if ack.get("accepted") != accepted:
+    if "conflicts" in ack:
+        value = ack["conflicts"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReplayError(
+                "receiver acknowledgement rejected: conflicts is not a non-negative integer"
+            )
+    if ack["accepted"] != accepted:
         raise ReplayError(
             "receiver acknowledgement rejected: accepted count does not match batch"
+        )
+    if ack["stored"] + ack["duplicates"] != ack["accepted"]:
+        raise ReplayError(
+            "receiver acknowledgement rejected: stored + duplicates != accepted"
         )
     expected = {"kind": kind, "machine": machine, "account": account}
     for field, value in expected.items():

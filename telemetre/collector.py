@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,9 +46,11 @@ def _safe_scandir(path: Path) -> list[os.DirEntry[str]] | None:
     try:
         with os.scandir(path) as entries:
             return list(entries)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return []
     except OSError:
+        # NotADirectoryError (a regular file where a branch is expected) and
+        # permission failures are scan failures, not zero-use scans.
         return None
 
 
@@ -101,7 +104,10 @@ def _parse_line(line: bytes, conversation_id: str) -> tuple[dict[str, Any] | Non
     """
     try:
         raw = json.loads(line.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # Includes JSONDecodeError, Python's oversized integer-literal
+        # ValueError, and deeply nested RecursionError.  One bad line is a
+        # diagnostic; later complete lines must still be parsed.
         return None, "invalid json"
     if not isinstance(raw, dict):
         return None, "line is not an object"
@@ -195,8 +201,16 @@ def collect(
         try:
             _ensure_identity(conn, machine, account)
             for root in root_paths:
-                if not root.is_dir():
+                try:
+                    root_mode = root.stat().st_mode
+                except FileNotFoundError:
                     counters.source_missing = True
+                    continue
+                except OSError:
+                    counters.source_errors += 1
+                    continue
+                if not stat.S_ISDIR(root_mode):
+                    counters.source_errors += 1
                     continue
                 for transcript in _transcript_paths(root, counters):
                     counters.files_seen += 1
