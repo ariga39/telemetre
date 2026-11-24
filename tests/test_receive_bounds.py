@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from telemetre.cli import main
 from tests.support import cli_json, model_step, run_cli, write_transcript
 
 
@@ -122,6 +126,41 @@ class ReceiveBoundsTest(unittest.TestCase):
             )
             self.assertEqual(empty["accounts"], {})
 
+    def test_invalid_limits_fail_before_stdin_read(self) -> None:
+        class NoReadStdin:
+            class Buffer:
+                def read(self, *args, **kwargs):
+                    raise AssertionError("stdin was read before limit validation")
+
+            buffer = Buffer()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            center = Path(tmp) / "center.sqlite"
+            for flag, value in (
+                ("--max-bytes", "-2"),
+                ("--max-bytes", "0"),
+                ("--max-rows", "-1"),
+                ("--max-rows", "0"),
+            ):
+                with self.subTest(flag=flag, value=value):
+                    output = io.StringIO()
+                    with mock.patch("sys.stdin", NoReadStdin()), contextlib.redirect_stdout(output):
+                        rc = main(
+                            [
+                                "receive",
+                                "--center-db",
+                                str(center),
+                                "--machine",
+                                "alpha",
+                                "--account",
+                                "acct",
+                                flag,
+                                value,
+                            ]
+                        )
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(json.loads(output.getvalue())["error"], "invalid batch")
+
     def test_json_shape_and_sqlite_overflow_are_generic_receive_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -153,6 +192,42 @@ class ReceiveBoundsTest(unittest.TestCase):
                     combined = result.stdout + result.stderr
                     self.assertNotIn(b"Traceback", combined)
                     self.assertNotIn(b"Overflow", combined)
+            empty = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-11",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(empty["accounts"], {})
+
+    def test_unpaired_surrogate_text_is_generic_failure_without_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = self._spool_three(base)
+            valid = json.loads(run_cli("pending", "--client-db", str(client)).stdout)
+            cases = []
+            model_bad = json.loads(json.dumps(valid))
+            model_bad["facts"][0]["model"] = "\ud800"
+            cases.append(("model", model_bad))
+            version_bad = json.loads(json.dumps(valid))
+            version_bad["collector_version"] = "\ud800"
+            cases.append(("collector_version", version_bad))
+            scan_version_bad = json.loads(json.dumps(valid))
+            scan_version_bad["scan"]["collector_version"] = "\ud800"
+            cases.append(("scan.collector_version", scan_version_bad))
+
+            center = base / "center.sqlite"
+            for label, batch in cases:
+                with self.subTest(label=label):
+                    result = self._receive(center, json.dumps(batch).encode())
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(json.loads(result.stdout)["error"], "invalid batch")
+                    self.assertNotIn(b"Traceback", result.stdout + result.stderr)
             empty = cli_json(
                 run_cli(
                     "report",

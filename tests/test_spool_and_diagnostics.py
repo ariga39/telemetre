@@ -321,6 +321,45 @@ class SpoolDiagnosticsTest(unittest.TestCase):
                 },
             )
 
+    def test_surrogate_model_is_bad_line_and_later_valid_row_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            write_transcript(
+                root,
+                "conv-surrogate",
+                [
+                    model_step(
+                        0,
+                        "2026-11-26T00:00:00Z",
+                        model="\ud800",
+                        input_tokens=999,
+                        cache_read_tokens=99,
+                        output_tokens=9,
+                    ),
+                    model_step(
+                        1,
+                        "2026-11-26T00:01:00Z",
+                        input_tokens=10,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    ),
+                ],
+            )
+            collected = _collect(base, root, client)
+            self.assertEqual(collected["bad_lines"], 1)
+            self.assertEqual(collected["new_facts"], 1)
+            _replay(base, client, center)
+            account = _report(center)["accounts"]["acct"]
+            self.assertEqual(account["account_total"], {
+                "input_tokens": 10,
+                "cache_read_tokens": 1,
+                "output_tokens": 2,
+                "model_steps": 1,
+            })
+
     def test_source_deleted_after_collection_and_lost_ack_do_not_lose_or_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

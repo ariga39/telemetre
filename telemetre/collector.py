@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 from . import __version__
 from .db import connect, init_client_schema
-from .protocol import COUNT_FIELDS, fact_digest, normalize_fact
+from .protocol import COUNT_FIELDS, ProtocolError, ensure_utf8_text, fact_digest, normalize_fact
 from .timeutil import utc_text
 
 
@@ -189,6 +189,13 @@ def collect(
     """Scan roots and commit file progress, facts and pending rows atomically."""
     if not machine.strip() or not account.strip():
         raise CollectorError("machine and account must be non-empty")
+    try:
+        ensure_utf8_text(machine, "machine")
+        ensure_utf8_text(account, "account")
+        if collector_version is not None:
+            ensure_utf8_text(collector_version, "collector_version")
+    except ProtocolError as exc:
+        raise CollectorError(str(exc)) from exc
     root_paths = [Path(root).expanduser() for root in roots]
     now = utc_text(datetime.now(timezone.utc))
     run_id = uuid.uuid4().hex
@@ -216,11 +223,17 @@ def collect(
                     counters.files_seen += 1
                     conversation_id = transcript.parents[2].name
                     try:
+                        path_text = ensure_utf8_text(str(transcript), "transcript path")
+                        ensure_utf8_text(conversation_id, "conversation_id")
+                    except ProtocolError:
+                        counters.source_errors += 1
+                        continue
+                    try:
                         before = transcript.stat()
                         signature = _stat_signature(before)
                         state = conn.execute(
                             "SELECT dev, ino, size, mtime_ns, has_partial FROM file_state WHERE path = ?",
-                            (str(transcript),),
+                            (path_text,),
                         ).fetchone()
                         unchanged = (
                             state is not None
@@ -325,7 +338,7 @@ def collect(
                             "mtime_ns=excluded.mtime_ns, has_partial=excluded.has_partial, "
                             "last_scan_run=excluded.last_scan_run, last_scanned_at=excluded.last_scanned_at",
                             (
-                                str(transcript),
+                                path_text,
                                 conversation_id,
                                 signature[0],
                                 signature[1],

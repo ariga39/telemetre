@@ -21,11 +21,18 @@ from .protocol import (
     ProtocolError,
     fact_digest,
     validate_batch,
+    validate_context,
 )
 from .timeutil import parse_rfc3339, to_us, utc_text
 
 DEFAULT_MAX_ROWS = 1000
 DEFAULT_MAX_BYTES = 256 * 1024
+
+
+def validate_limits(max_rows: Any, max_bytes: Any) -> None:
+    for field, value in (("max_rows", max_rows), ("max_bytes", max_bytes)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ProtocolError(f"{field} must be a positive integer")
 
 
 def _merge_event(
@@ -198,6 +205,8 @@ def receive(
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> dict[str, Any]:
     """Validate, commit and only then acknowledge one bounded batch."""
+    validate_limits(max_rows, max_bytes)
+    validate_context(context)
     if context.kind != KIND_AGY_USAGE:
         raise ProtocolError(f"unsupported bound kind: {context.kind!r}")
     if not isinstance(raw, (bytes, bytearray)):

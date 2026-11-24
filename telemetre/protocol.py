@@ -47,10 +47,35 @@ class IngestContext:
     kind: str = KIND_AGY_USAGE
 
 
+def ensure_utf8_text(value: Any, field: str) -> str:
+    """Reject text that cannot be encoded as UTF-8 (for example lone surrogates)."""
+    if not isinstance(value, str):
+        raise ProtocolError(f"{field} must be a string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ProtocolError(f"{field} must be valid UTF-8 text") from exc
+    return value
+
+
 def _require_text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    text = ensure_utf8_text(value, field)
+    if not text.strip():
         raise ProtocolError(f"{field} must be a non-empty string")
-    return value.strip()
+    return text.strip()
+
+
+def _optional_text(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return ensure_utf8_text(value, field)
+
+
+def validate_context(context: IngestContext) -> None:
+    for field in ("machine", "account", "kind"):
+        text = ensure_utf8_text(getattr(context, field), field)
+        if not text.strip():
+            raise ProtocolError(f"{field} must be a non-empty string")
 
 
 def _count(value: Any, field: str) -> int | None:
@@ -127,9 +152,7 @@ def normalize_scan(raw: Any) -> dict[str, Any] | None:
         ):
             raise ProtocolError(f"scan.{field} must fit a non-negative SQLite integer")
         scan[field] = value
-    version = raw.get("collector_version")
-    if version is not None and not isinstance(version, str):
-        raise ProtocolError("scan.collector_version must be a string or null")
+    version = _optional_text(raw.get("collector_version"), "scan.collector_version")
     scan["collector_version"] = version
     return scan
 
@@ -153,9 +176,7 @@ def validate_batch(
         raise ProtocolError(f"batch has {len(facts_raw)} facts, limit is {max_rows}")
     facts = [normalize_fact(raw, index) for index, raw in enumerate(facts_raw)]
     scan = normalize_scan(payload.get("scan"))
-    collector_version = payload.get("collector_version")
-    if collector_version is not None and not isinstance(collector_version, str):
-        raise ProtocolError("collector_version must be a string or null")
+    collector_version = _optional_text(payload.get("collector_version"), "collector_version")
     return facts, scan, collector_version
 
 

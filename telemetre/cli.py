@@ -19,7 +19,7 @@ from .replay import (
     replay_pending,
     spool_identity,
 )
-from .receiver import DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, receive
+from .receiver import DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, receive, validate_limits
 from .report import build_report, render_text as render_report_text
 from .status import check_status, render_status_text
 
@@ -124,6 +124,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
 
 def _cmd_receive(args: argparse.Namespace) -> int:
     context = IngestContext(machine=args.machine, account=args.account, kind=args.kind)
+    validate_limits(args.max_rows, args.max_bytes)
     raw = sys.stdin.buffer.read(args.max_bytes + 1)
     ack = receive(
         args.center_db,
