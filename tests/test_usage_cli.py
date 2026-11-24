@@ -2,14 +2,104 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+from telemetre.cli import main
 from tests.support import cli_json, model_step, run_cli, write_transcript
 
 
 class TwoMachineMonthlyReportTest(unittest.TestCase):
+    def test_invalid_utf8_root_is_reported_without_losing_good_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            good_root = base / "good"
+            write_transcript(
+                good_root,
+                "conv-good",
+                [
+                    model_step(
+                        0,
+                        "2026-11-27T00:00:00Z",
+                        input_tokens=10,
+                        cache_read_tokens=1,
+                        output_tokens=2,
+                    )
+                ],
+            )
+            bad_root = os.fsdecode(os.fsencode(str(base)) + b"/bad-\xff")
+            client = base / "client.sqlite"
+            center = base / "center.sqlite"
+            buffer = io.BytesIO()
+            stream = io.TextIOWrapper(buffer, encoding="utf-8", errors="strict")
+            with contextlib.redirect_stdout(stream):
+                rc = main(
+                    [
+                        "collect",
+                        "--client-db",
+                        str(client),
+                        "--machine",
+                        "alpha",
+                        "--account",
+                        "acct",
+                        "--root",
+                        bad_root,
+                        "--root",
+                        str(good_root),
+                        "--format",
+                        "json",
+                    ]
+                )
+            stream.flush()
+            self.assertEqual(rc, 0)
+            collected = json.loads(buffer.getvalue().decode("utf-8"))
+            self.assertEqual(collected["new_facts"], 1)
+            self.assertGreaterEqual(collected["source_errors"], 1)
+            self.assertEqual(collected["invalid_roots"], 1)
+            self.assertFalse(collected["source_missing"])
+            self.assertEqual(collected["roots"], [str(good_root)])
+
+            cli_json(
+                run_cli(
+                    "replay",
+                    "--client-db",
+                    str(client),
+                    "--center-db",
+                    str(center),
+                    "--machine",
+                    "alpha",
+                    "--account",
+                    "acct",
+                    "--format",
+                    "json",
+                )
+            )
+            report = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-11",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(
+                report["accounts"]["acct"]["account_total"],
+                {
+                    "input_tokens": 10,
+                    "cache_read_tokens": 1,
+                    "output_tokens": 2,
+                    "model_steps": 1,
+                },
+            )
+
     def test_two_roots_on_one_machine_are_both_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

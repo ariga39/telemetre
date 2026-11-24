@@ -66,7 +66,8 @@ def _cmd_collect(args: argparse.Namespace) -> int:
             f"({result['files_skipped']} unchanged); bad_lines={result['bad_lines']}, "
             f"missing_count_steps={result['missing_count_steps']}, "
             f"pending_backlog={result['pending_backlog']}, "
-            f"source_missing={str(result['source_missing']).lower()}"
+            f"source_missing={str(result['source_missing']).lower()}, "
+            f"invalid_roots={result['invalid_roots']}"
         )
     return 0
 

@@ -155,9 +155,10 @@ python3 -m telemetre status \
   [--format text|json]
 ```
 
-Exits non-zero when an expected source has never reported, its last scan is
-stale, or its configured root was missing. Without `--expected`, all sources
-known to the centre are checked.
+Exits non-zero if an expected source has no successful scan, its last
+success time is invalid or stale, its configured root is missing, or the
+collector reported a read or directory traversal error. Without
+`--expected`, all sources known to the centre are checked.
 
 ## Wire protocol
 

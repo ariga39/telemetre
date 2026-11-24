@@ -126,6 +126,53 @@ class ReceiveBoundsTest(unittest.TestCase):
             )
             self.assertEqual(empty["accounts"], {})
 
+    def test_invalid_event_and_scan_timestamps_are_invalid_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = self._spool_three(base)
+            valid = json.loads(run_cli("pending", "--client-db", str(client)).stdout)
+            bad_event = json.loads(json.dumps(valid))
+            bad_event["facts"][0]["event_time"] = "not-a-time"
+            bad_event_range = json.loads(json.dumps(valid))
+            bad_event_range["facts"][0]["event_time"] = "0001-01-01T00:00:00+01:00"
+            bad_scan = json.loads(json.dumps(valid))
+            bad_scan["scan"]["completed_at"] = "not-a-time"
+            center = base / "center.sqlite"
+            for label, batch in (
+                ("event", bad_event),
+                ("event-range", bad_event_range),
+                ("scan", bad_scan),
+            ):
+                with self.subTest(label=label):
+                    result = self._receive(center, json.dumps(batch).encode())
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(json.loads(result.stdout)["error"], "invalid batch")
+                    self.assertNotIn(b"Traceback", result.stdout + result.stderr)
+            empty = cli_json(
+                run_cli(
+                    "report",
+                    "--center-db",
+                    str(center),
+                    "--month",
+                    "2026-11",
+                    "--format",
+                    "json",
+                )
+            )
+            self.assertEqual(empty["accounts"], {})
+
+    def test_operational_database_failure_stays_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = self._spool_three(base)
+            batch = run_cli("pending", "--client-db", str(client)).stdout
+            center_directory = base / "center-is-a-directory"
+            center_directory.mkdir()
+            result = self._receive(center_directory, batch)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["error"], "receive failed")
+            self.assertNotIn(b"Traceback", result.stdout + result.stderr)
+
     def test_invalid_limits_fail_before_stdin_read(self) -> None:
         class NoReadStdin:
             class Buffer:

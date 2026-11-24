@@ -34,6 +34,7 @@ class ScanCounters:
     source_missing: bool = False
     source_errors: int = 0
     roots: list[str] = field(default_factory=list)
+    invalid_roots: int = 0
 
 
 def _safe_scandir(path: Path) -> list[os.DirEntry[str]] | None:
@@ -196,11 +197,22 @@ def collect(
             ensure_utf8_text(collector_version, "collector_version")
     except ProtocolError as exc:
         raise CollectorError(str(exc)) from exc
-    root_paths = [Path(root).expanduser() for root in roots]
+    root_paths = []
+    counters = ScanCounters()
+    for root in roots:
+        try:
+            ensure_utf8_text(str(root), "root")
+            root_path = Path(root).expanduser()
+            ensure_utf8_text(str(root_path), "root")
+        except ProtocolError:
+            counters.invalid_roots += 1
+            counters.source_errors += 1
+            continue
+        root_paths.append(root_path)
+        counters.roots.append(str(root_path))
+
     now = utc_text(datetime.now(timezone.utc))
     run_id = uuid.uuid4().hex
-    counters = ScanCounters(roots=[str(root) for root in root_paths])
-
     conn = connect(client_db)
     try:
         init_client_schema(conn)
@@ -389,6 +401,7 @@ def collect(
         "account": account,
         "completed_at": completed_at,
         "roots": counters.roots,
+        "invalid_roots": counters.invalid_roots,
         "files_seen": counters.files_seen,
         "files_read": counters.files_read,
         "files_skipped": counters.files_skipped,

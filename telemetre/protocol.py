@@ -88,6 +88,15 @@ def _count(value: Any, field: str) -> int | None:
     return value
 
 
+def _parse_timestamp(value: str, field: str) -> int:
+    try:
+        return to_us(parse_rfc3339(value))
+    except ValueError as exc:
+        # Parser failures are protocol shape/type failures, not operational DB
+        # failures, and must reach the bounded-receive invalid-batch contract.
+        raise ProtocolError(f"{field} is not a valid RFC3339 timestamp") from exc
+
+
 def normalize_fact(raw: Any, index: int = 0) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ProtocolError(f"facts[{index}] must be an object")
@@ -102,7 +111,7 @@ def normalize_fact(raw: Any, index: int = 0) -> dict[str, Any]:
         raise ProtocolError("step_index must fit a non-negative SQLite integer")
     model = _require_text(raw.get("model"), "model")
     event_text = _require_text(raw.get("event_time"), "event_time")
-    event_us = to_us(parse_rfc3339(event_text))
+    event_us = _parse_timestamp(event_text, "event_time")
     if event_us < MIN_SQLITE_INT or event_us > MAX_SQLITE_INT:
         raise ProtocolError("event_time is outside the SQLite integer range")
     fact = {
@@ -137,7 +146,7 @@ def normalize_scan(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         raise ProtocolError("scan must be an object or null")
     completed_text = _require_text(raw.get("completed_at"), "scan.completed_at")
-    completed_us = to_us(parse_rfc3339(completed_text))
+    completed_us = _parse_timestamp(completed_text, "scan.completed_at")
     scan: dict[str, Any] = {
         "completed_at": utc_text(completed_us),
         "run_id": _require_text(raw.get("run_id"), "scan.run_id"),
