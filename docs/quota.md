@@ -264,6 +264,58 @@ Dated report:
 success time, and missing intervals for each window/account, then prints it.
 `report --date` recomputes the same view from stored samples.
 
+## Estimate the value of an agy quota window
+
+How much API usage would a full 5-hour or weekly allowance cover at your
+current mix of models? Measure the API value of calls between two quota
+snapshots and divide by the fraction of the allowance consumed between them.
+Both snapshots can be taken partway through the window.
+
+1. Use `iter_observations` (example below) to pick two successful samples
+   for the same agy account, bucket ID, window duration, and known reset time.
+   Check the intervening samples for resets, missing readings, or sampling
+   gaps. Record the exact `sampled_at` timestamps and the two raw
+   `remaining_value` fractions. Prefer a substantial positive drop to reduce
+   sensitivity to rounding and delays in quota updates.
+2. In the centre usage database, select the account's deduplicated model
+   events with `start < event time <= end`. Include every machine using that
+   account. The query below returns one row per model. Keep the models that
+   draw from the selected bucket. Check coverage before pricing the rows:
+   missing counts, conflicting events, or a machine that has yet to deliver
+   usage leave part of the interval unpriced. See the [usage report](agy-usage.md#report).
+3. For each model, multiply input, cache-read, and output tokens by their
+   respective API prices per million tokens, then divide by one million.
+   Sum the model costs. Record the price date and any assumptions about
+   billable tokens that the logs do not distinguish, such as thinking tokens.
+4. Divide the interval cost by `start_fraction - end_fraction` to estimate
+   the API value of a full window. Multiply that result by the latest
+   remaining fraction to estimate the remaining value. Repeat with another
+   interval to see how sensitive the estimate is to the workload and endpoints.
+
+For an interval query, bind `:account` to the account alias and
+`:start_us` and `:end_us` to UTC epoch microseconds. Convert each
+timestamp with `to_us(parse_rfc3339(sampled_at))` from `telemetre.timeutil`.
+The three field counts should each equal the step count for a fully measured row.
+
+```sql
+SELECT model, COUNT(*) AS steps,
+       SUM(input_tokens), SUM(cache_read_tokens), SUM(output_tokens),
+       COUNT(input_tokens), COUNT(cache_read_tokens), COUNT(output_tokens)
+FROM events
+WHERE account = :account AND event_us > :start_us AND event_us <= :end_us
+  AND status != 'conflict'
+GROUP BY model;
+```
+
+**Worked example with illustrative rates.** Between two snapshots, one
+model used 500,000 input, 2,000,000 cache-read, and 100,000 output tokens.
+At $3, $0.15, and $15 per million respectively, that interval cost
+`0.5 × $3 + 2 × $0.15 + 0.1 × $15 = $3.30`. If the 5-hour balance fell
+from 80% to 50%, a full 5-hour allowance was worth about `$3.30 / 0.30 = $11`
+at that usage mix. If the weekly balance fell from 70% to 60% over the same
+interval, a full week was worth about `$3.30 / 0.10 = $33`. Both limits apply
+to the same calls, so adding the two estimates would count that usage twice.
+
 ## Slice-3 seam
 
 The delivery/receiver slice should use this public, sanitized interface rather
